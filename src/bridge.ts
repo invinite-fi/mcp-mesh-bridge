@@ -58,6 +58,9 @@ export const explain = (e: unknown, url: URL): string => {
   return `${url.origin}: ${e instanceof Error ? e.message : String(e)}`;
 };
 
+/** How long a transport replaced by a new session stays open for requests under way on it. */
+const RETIRE = 30_000;
+
 const protocolVersionOf = (result: unknown): string | undefined => {
   const v = (result as { protocolVersion?: unknown } | undefined)?.protocolVersion;
   return typeof v === 'string' ? v : undefined;
@@ -117,13 +120,21 @@ export const bridge = async (local: Transport, opts: BridgeOptions): Promise<voi
       signingIn = undefined;
     }));
 
-  /** Send, signing in once if the server asks for it. */
+  /** Send on the current transport, signing in once if the server asks for it. */
   const sendSigned = async (m: JSONRPCMessage): Promise<void> => {
     try {
       await remote.send(m);
     } catch (e) {
-      if (!(e instanceof UnauthorizedError)) throw e;
-      await signInOnce();
+      if (e instanceof UnauthorizedError) {
+        await signInOnce();
+      } else if (e instanceof StreamableHTTPError && e.code === 401) {
+        // The transport keeps one "just signed in" flag for all requests: a
+        // request whose 401 crossed another's refresh is refused by it,
+        // though the tokens are fresh by now. Once more is enough.
+        await signingIn?.catch(() => undefined);
+      } else {
+        throw e;
+      }
       await remote.send(m);
     }
   };
@@ -142,9 +153,9 @@ export const bridge = async (local: Transport, opts: BridgeOptions): Promise<voi
     (reopening ??= (async () => {
       log(`${url.origin} no longer knows the session; starting a new one`);
       const old = remote;
-      old.onmessage = () => undefined;
-      old.onerror = () => undefined;
-      await old.close().catch(() => undefined);
+      // Closing at once would abort requests still under way on the old
+      // session, which could then run twice; they get a while to finish.
+      setTimeout(() => void old.close().catch(() => undefined), RETIRE).unref();
       await open();
       if (!initialize) return;
       const answer = await ask({ ...initialize, id: `mcp-mesh-bridge-${++own}` });
@@ -161,13 +172,18 @@ export const bridge = async (local: Transport, opts: BridgeOptions): Promise<voi
     await reopening?.catch(() => undefined);
     if (isInitializeRequest(m) && isJSONRPCRequest(m)) initialize = m;
     if (isInitializedNotification(m)) initialized = m;
-    const session = remote.sessionId;
+    const sentOn = remote;
+    const session = sentOn.sessionId;
     try {
       await sendSigned(m);
     } catch (e) {
+      if (isInitializeRequest(m)) throw e;
       const forgotten = e instanceof StreamableHTTPError && e.code === 404 && session !== undefined;
-      if (!forgotten || isInitializeRequest(m)) throw e;
-      await reopenOnce();
+      // Another request may have started a new session meanwhile.
+      const replaced = sentOn !== remote;
+      if (!forgotten && !replaced) throw e;
+      if (forgotten && !replaced) await reopenOnce();
+      else await reopening?.catch(() => undefined);
       await sendSigned(m);
     }
   };

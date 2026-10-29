@@ -136,6 +136,22 @@ test('a session the server forgot is started again and the request retried', asy
   assert.equal(fake.initializes, 2);
 });
 
+test('requests meeting a forgotten session together share one new session', async () => {
+  const fake = await started();
+  const claude = await connect(fake.mcp, memoryStore(), browser().open);
+  await initialize(claude);
+  await claude.notify('notifications/initialized');
+
+  fake.forget();
+  const answers = await Promise.all([
+    claude.request('tools/list'),
+    claude.request('tools/call', { name: 'echo', arguments: { n: 1 } }),
+    claude.request('tools/call', { name: 'echo', arguments: { n: 2 } }),
+  ]);
+  for (const a of answers) result(a);
+  assert.equal(fake.initializes, 2);
+});
+
 test('a static client signs in without registering', async () => {
   const fake = await started({ staticClient: 'pre-registered' });
   const claude = await connect(fake.mcp, memoryStore(), browser().open, {
