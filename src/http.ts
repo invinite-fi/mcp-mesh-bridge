@@ -42,7 +42,9 @@ export const sharedKey = (url: string | URL, init?: RequestInit): string | undef
 /** A stream that errors once more than `limit` bytes pass, or for an event stream, one event. */
 const capped = (limit: number, perEvent: boolean): TransformStream<Uint8Array, Uint8Array> => {
   let count = 0;
-  let newline = false;
+  /** The last line ended with nothing after it yet. */
+  let ended = false;
+  let cr = false;
   return new TransformStream({
     transform(chunk, controller) {
       const over = () =>
@@ -50,12 +52,17 @@ const capped = (limit: number, perEvent: boolean): TransformStream<Uint8Array, U
       if (perEvent) {
         for (const byte of chunk) {
           if (++count > limit) return over();
-          if (byte === 0x0a) {
-            // A blank line ends an event.
-            if (newline) count = 0;
-            newline = true;
-          } else if (byte !== 0x0d) {
-            newline = false;
+          // A line ends with CRLF, LF or CR; a blank line ends an event.
+          if (byte === 0x0a && cr) {
+            cr = false;
+            continue;
+          }
+          cr = byte === 0x0d;
+          if (byte === 0x0a || byte === 0x0d) {
+            if (ended) count = 0;
+            ended = true;
+          } else {
+            ended = false;
           }
         }
       } else if ((count += chunk.byteLength) > limit) {
@@ -69,7 +76,9 @@ const capped = (limit: number, perEvent: boolean): TransformStream<Uint8Array, U
 /** `response` with its body capped at `limit` bytes. */
 export const limitBody = (response: Response, limit = MAX_BODY): Response => {
   if (!response.body) return response;
-  const sse = (response.headers.get('content-type') ?? '').includes('text/event-stream');
+  const sse = (response.headers.get('content-type') ?? '')
+    .toLowerCase()
+    .includes('text/event-stream');
   const limited = new Response(response.body.pipeThrough(capped(limit, sse)), {
     status: response.status,
     statusText: response.statusText,

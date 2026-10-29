@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { main, parse } from '../src/cli.js';
+import { main, parse, sameIssuer } from '../src/cli.js';
 import { portFor } from '../src/port.js';
 import { keyFor } from '../src/store.js';
-import { memoryStore, startFake } from './fake.js';
+import { memoryStore, startFake, type Fake } from './fake.js';
 
 const URL_A = 'https://mcp.example.internal/mcp';
 
@@ -51,17 +51,28 @@ test('bad input is refused with a reason', () => {
   assert.ok('exit' in help && help.exit === 0);
 });
 
+/** A stored sign-in to `fake`, as the SDK stamps it. */
+const signedIn = (
+  store: ReturnType<typeof memoryStore>,
+  fake: Fake,
+  refreshToken: string,
+  issuer: string | null = fake.base,
+) => {
+  const stamp = issuer === null ? {} : { issuer };
+  store.entries.set(
+    keyFor(fake.mcp.href),
+    JSON.stringify({
+      client: { client_id: 'client-x', ...stamp },
+      tokens: { access_token: 'at', token_type: 'Bearer', refresh_token: refreshToken, ...stamp },
+    }),
+  );
+};
+
 test('logout revokes the refresh token and says what it removed', async () => {
   const fake = await startFake();
   try {
     const store = memoryStore();
-    store.entries.set(
-      keyFor(fake.mcp.href),
-      JSON.stringify({
-        client: { client_id: 'client-x' },
-        tokens: { access_token: 'at', token_type: 'Bearer', refresh_token: 'rt-x' },
-      }),
-    );
+    signedIn(store, fake, 'rt-x');
     const logs: string[] = [];
     const log = (m: string) => void logs.push(m);
     assert.equal(await main(['--logout', fake.mcp.href], {}, store, log), 0);
@@ -78,18 +89,47 @@ test('logout revokes the refresh token and says what it removed', async () => {
     assert.deepEqual(logs, [`nothing was stored for ${fake.base} in memory`]);
 
     // A configured client is the one the tokens were issued to.
-    store.entries.set(
-      keyFor(fake.mcp.href),
-      JSON.stringify({
-        client: { client_id: 'client-x' },
-        tokens: { access_token: 'at', token_type: 'Bearer', refresh_token: 'rt-y' },
-      }),
-    );
+    signedIn(store, fake, 'rt-y');
     await main(['--logout', fake.mcp.href, '--client-id', 'fixed'], {}, store, log);
     assert.deepEqual(fake.revoked[1], { token: 'rt-y', clientId: 'fixed' });
   } finally {
     await fake.close();
   }
+});
+
+test('logout sends the token only to the server that issued it', async () => {
+  const elsewhere = 'https://other.example/revoke';
+  const fake = await startFake();
+  const moved = await startFake({ revocationEndpoint: elsewhere });
+  try {
+    const cases: [Fake, string | null, RegExp][] = [
+      [fake, null, /it does not say which server issued it/],
+      [fake, 'https://as.example', /now names another sign-in server than https:\/\/as.example/],
+      [moved, moved.base, /its revocation endpoint is not on http:\/\/127\.0\.0\.1:\d+/],
+    ];
+    for (const [server, issuer, why] of cases) {
+      const store = memoryStore();
+      signedIn(store, server, 'rt-z', issuer);
+      const logs: string[] = [];
+      await main(['--logout', server.mcp.href], {}, store, (m) => void logs.push(m));
+      assert.equal(server.revoked.length, 0);
+      assert.match(logs[0] ?? '', /^not asking the server to revoke the sign-in: /);
+      assert.match(logs[0] ?? '', why);
+      assert.match(logs[1] ?? '', /^signed out of /);
+      assert.equal(store.entries.size, 0);
+    }
+  } finally {
+    await fake.close();
+    await moved.close();
+  }
+});
+
+test('issuers compare as URLs, a trailing slash aside', () => {
+  assert.ok(sameIssuer('https://as.example', 'https://as.example/'));
+  assert.ok(sameIssuer('HTTPS://AS.example:443/', 'https://as.example'));
+  assert.ok(!sameIssuer('https://as.example', 'https://as.example/tenant'));
+  assert.ok(!sameIssuer('https://as.example', 'http://as.example'));
+  assert.ok(!sameIssuer('not a url', 'not a url'));
 });
 
 test('plain http to another machine is warned about', async () => {

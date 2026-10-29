@@ -83,6 +83,10 @@ test('an event stream is capped per event', async () => {
   assert.equal(await limitBody(sse(many), 50).text(), many);
   const crlf = event.replaceAll('\n', '\r\n').repeat(5);
   assert.equal(await limitBody(sse(crlf), 50).text(), crlf);
+  const cr = event.replaceAll('\n', '\r').repeat(5);
+  assert.equal(await limitBody(sse(cr), 50).text(), cr);
+  const upper = new Response(many, { headers: { 'content-type': 'Text/Event-Stream' } });
+  assert.equal(await limitBody(upper, 50).text(), many);
   await assert.rejects(limitBody(sse(`data: ${'x'.repeat(60)}\n\n`), 50).text());
 });
 

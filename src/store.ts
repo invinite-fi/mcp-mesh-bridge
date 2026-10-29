@@ -12,20 +12,32 @@
 // on a command line, where other processes could read it.
 import { spawn } from 'node:child_process';
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
-import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, win32 } from 'node:path';
+
+export type WriteOptions = {
+  /**
+   * Whether the entry may be created. When false, only an entry still there
+   * is replaced: one removed meanwhile, by `--logout`, stays removed.
+   */
+  create?: boolean;
+};
 
 export type SecretStore = {
   /** Where entries are kept, for messages. */
   readonly where: string;
+  /** The entry, or undefined when there is none; an entry that is there but cannot be read is an error. */
   read: (key: string) => Promise<string | undefined>;
-  write: (key: string, value: string) => Promise<void>;
+  /** Whether it was written: false only when `create` is false and the entry is gone. */
+  write: (key: string, value: string, opts?: WriteOptions) => Promise<boolean>;
   /** Whether there was anything to remove. */
   remove: (key: string) => Promise<boolean>;
 };
 
 const NAME = 'mcp-mesh-bridge';
+/** How old a temporary file must be before a write takes it for one a crash left. */
+const STRAY = 60_000;
 
 /** The entry key for a server URL: a hash, so no URL reaches a file name or a command. */
 export const keyFor = (serverUrl: string): string =>
@@ -50,6 +62,26 @@ export const run: Run = (command, args, input) =>
     child.stdin.end(input ?? '');
   });
 
+/** `store` with the writes and removals of one entry made one at a time. */
+const queued = (store: SecretStore): SecretStore => {
+  const tails = new Map<string, Promise<unknown>>();
+  const inTurn = <T>(key: string, job: () => Promise<T>): Promise<T> => {
+    const result = (tails.get(key) ?? Promise.resolve()).then(job, job);
+    const tail = result.catch(() => undefined);
+    tails.set(key, tail);
+    void tail.then(() => {
+      if (tails.get(key) === tail) tails.delete(key);
+    });
+    return result;
+  };
+  return {
+    where: store.where,
+    read: store.read,
+    write: (key, value, opts) => inTurn(key, () => store.write(key, value, opts)),
+    remove: (key) => inTurn(key, () => store.remove(key)),
+  };
+};
+
 // --- Files --------------------------------------------------------------------
 
 const isMissing = (e: unknown) => (e as NodeJS.ErrnoException | undefined)?.code === 'ENOENT';
@@ -64,10 +96,39 @@ export const readIfThere = async (path: string): Promise<string | undefined> => 
   }
 };
 
+const exists = async (path: string): Promise<boolean> => {
+  try {
+    await stat(path);
+    return true;
+  } catch (e) {
+    if (isMissing(e)) return false;
+    throw e;
+  }
+};
+
+/** Remove the temporary files of writes that never finished. */
+const sweep = async (dir: string): Promise<void> => {
+  const names = await readdir(dir).catch(() => [] as string[]);
+  const before = Date.now() - STRAY;
+  await Promise.all(
+    names
+      .filter((n) => n.startsWith('.') && n.endsWith('.tmp'))
+      .map(async (n) => {
+        const path = join(dir, n);
+        try {
+          if ((await stat(path)).mtimeMs < before) await rm(path, { force: true });
+        } catch {
+          // Another write removed it first.
+        }
+      }),
+  );
+};
+
 /** Write `name` in `dir` whole or not at all, readable by its owner only. */
 export const writeAtomic = async (dir: string, name: string, data: string): Promise<void> => {
   await mkdir(dir, { recursive: true, mode: 0o700 });
   await chmod(dir, 0o700);
+  await sweep(dir);
   const temp = join(dir, `.${name}.${randomBytes(6).toString('hex')}.tmp`);
   try {
     await writeFile(temp, data, { encoding: 'utf8', mode: 0o600 });
@@ -92,12 +153,19 @@ const removeIfThere = async (path: string): Promise<boolean> => {
 
 export const fileStore = (
   dir = join(process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config'), NAME),
-): SecretStore => ({
-  where: `${dir}, readable by its owner only`,
-  read: (key) => readIfThere(join(dir, `${key}.json`)),
-  write: (key, value) => writeAtomic(dir, `${key}.json`, value),
-  remove: (key) => removeIfThere(join(dir, `${key}.json`)),
-});
+): SecretStore => {
+  const path = (key: string) => join(dir, `${key}.json`);
+  return queued({
+    where: `${dir}, readable by its owner only`,
+    read: (key) => readIfThere(path(key)),
+    write: async (key, value, opts) => {
+      if (opts?.create === false && !(await exists(path(key)))) return false;
+      await writeAtomic(dir, `${key}.json`, value);
+      return true;
+    },
+    remove: (key) => removeIfThere(path(key)),
+  });
+};
 
 // --- macOS: AES-256-GCM, its key in the Keychain ------------------------------
 
@@ -152,9 +220,17 @@ export const keychainRemoveArgs = (key: string, keychain?: string): string[] => 
   ...(keychain ? [keychain] : []),
 ];
 
-/** The command `security -i` reads from stdin to add or update an entry's key. */
-export const keychainWriteCommand = (key: string, hex: string, keychain?: string): string =>
-  `add-generic-password -U -s ${NAME} -a ${key} -w ${hex}${keychain ? ` ${keychain}` : ''}\n`;
+/**
+ * The command `security -i` reads from stdin to add an entry's key. Without
+ * `replace` it fails if a key is there already, so the first of two writers wins.
+ */
+export const keychainWriteCommand = (
+  key: string,
+  hex: string,
+  keychain?: string,
+  replace = false,
+): string =>
+  `add-generic-password${replace ? ' -U' : ''} -s ${NAME} -a ${key} -w ${hex}${keychain ? ` ${keychain}` : ''}\n`;
 
 export type KeychainOptions = {
   /** Where the encrypted entries go. */
@@ -172,49 +248,58 @@ export const keychainStore = (opts: KeychainOptions = {}): SecretStore => {
   const exec = opts.exec ?? run;
   const path = (key: string) => join(dir, `${key}.enc`);
 
-  const readKey = async (key: string): Promise<Buffer | undefined> => {
+  const readKey = async (key: string): Promise<Buffer | 'missing' | 'unusable'> => {
     const r = await exec(SECURITY, keychainReadArgs(key, opts.keychain));
-    if (r.code === NOT_FOUND) return undefined;
+    if (r.code === NOT_FOUND) return 'missing';
     if (r.code !== 0) throw new Error(`the Keychain could not be read (exit ${r.code})`);
     const hex = r.stdout.trim();
-    if (!/^[0-9a-f]{64}$/.test(hex)) throw new Error('the Keychain holds no usable key for it');
-    return Buffer.from(hex, 'hex');
+    return /^[0-9a-f]{64}$/.test(hex) ? Buffer.from(hex, 'hex') : 'unusable';
   };
 
-  return {
+  return queued({
     where: `${dir}, encrypted with a key in the macOS Keychain`,
     read: async (key) => {
       const sealed = await readIfThere(path(key));
       if (sealed === undefined) return undefined;
       const k = await readKey(key);
-      if (!k) throw new Error('the key for the stored sign-in is missing from the Keychain');
+      // `--logout` removes the key first: a file without one is an entry removed.
+      if (k === 'missing') return undefined;
+      if (k === 'unusable') throw new Error('the Keychain holds no usable key for it');
       return unseal(k, key, sealed);
     },
-    write: async (key, value) => {
-      let k = await readKey(key).catch(() => undefined);
-      if (!k) {
-        k = randomBytes(32);
+    write: async (key, value, { create = true } = {}) => {
+      let k = await readKey(key);
+      if (!Buffer.isBuffer(k)) {
+        if (k === 'missing' && !create) return false;
+        if (k === 'unusable' && !create) throw new Error('the Keychain holds no usable key for it');
         const r = await exec(
           SECURITY,
           ['-i'],
-          keychainWriteCommand(key, k.toString('hex'), opts.keychain),
+          keychainWriteCommand(
+            key,
+            randomBytes(32).toString('hex'),
+            opts.keychain,
+            k === 'unusable',
+          ),
         );
-        // `security -i` reports a failed command on stderr but exits 0.
-        if (r.code !== 0 || r.stderr.trim() !== '') {
+        // Another process may have added a key first, and `security -i` exits 0
+        // whatever happened: the key now in the Keychain is the one to use.
+        k = await readKey(key);
+        if (!Buffer.isBuffer(k))
           throw new Error(`the Keychain could not be written (exit ${r.code})`);
-        }
       }
       await writeAtomic(dir, `${key}.enc`, seal(k, key, value));
+      return true;
     },
     remove: async (key) => {
-      const had = await removeIfThere(path(key));
       const r = await exec(SECURITY, keychainRemoveArgs(key, opts.keychain));
       if (r.code !== 0 && r.code !== NOT_FOUND) {
         throw new Error(`the Keychain entry could not be removed (exit ${r.code})`);
       }
+      const had = await removeIfThere(path(key));
       return had || r.code === 0;
     },
-  };
+  });
 };
 
 // --- Windows: DPAPI, through Windows PowerShell -------------------------------
@@ -261,19 +346,21 @@ export const dpapiStore = (
       throw new Error(`DPAPI could not ${direction.toLowerCase()} (exit ${r.code})`);
     return r.stdout.trim();
   };
-  return {
+  return queued({
     where: `${dir}, encrypted for the current Windows user`,
     read: async (key) => {
       const sealed = await readIfThere(path(key));
       if (sealed === undefined) return undefined;
       return Buffer.from(await dpapi('Unprotect', sealed.trim()), 'base64').toString('utf8');
     },
-    write: async (key, value) => {
+    write: async (key, value, opts) => {
+      if (opts?.create === false && !(await exists(path(key)))) return false;
       const sealed = await dpapi('Protect', Buffer.from(value, 'utf8').toString('base64'));
       await writeAtomic(dir, `${key}.dat`, sealed);
+      return true;
     },
     remove: (key) => removeIfThere(path(key)),
-  };
+  });
 };
 
 /** The store for this platform. */

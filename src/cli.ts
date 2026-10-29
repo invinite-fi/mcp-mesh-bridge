@@ -7,7 +7,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { bridge } from './bridge.js';
 import { clip, guardedFetch } from './http.js';
-import { isLoopback, mayOpen, openInBrowser, signIn, type Saved } from './oauth.js';
+import { configuredClient, isLoopback, openInBrowser, signIn, type Saved } from './oauth.js';
 import { portFor } from './port.js';
 import { keyFor, platformStore, type SecretStore } from './store.js';
 
@@ -94,27 +94,51 @@ const stderrLog = (message: string): void => {
 
 type Log = (message: string) => void;
 
+/** Whether two authorization server URLs name one server, a trailing `/` aside, as the SDK compares them. */
+export const sameIssuer = (a: string, b: string): boolean => {
+  const trim = (u: string) => new URL(u).href.replace(/\/$/, '');
+  try {
+    return trim(a) === trim(b);
+  } catch {
+    return false;
+  }
+};
+
 /**
  * Ask the server to forget a refresh token, where its authorization server
  * offers revocation. Best effort: signing out here does not depend on it.
+ * The token goes only to the server that issued it, as discovery names it
+ * now, and only to a revocation endpoint on that server's own origin.
  */
-const revoke = async (url: URL, saved: Saved, fetchFn: FetchLike, log: Log): Promise<void> => {
+const revoke = async (
+  url: URL,
+  saved: Saved,
+  fetchFn: FetchLike,
+  log: Log,
+  client = saved.client,
+): Promise<void> => {
   const token = saved.tokens?.refresh_token;
-  if (!token || !saved.client) return;
+  if (!token || !client) return;
+  const skip = (why: string) =>
+    log(`not asking the server to revoke the sign-in: ${why}; it ends when the server lets it`);
+  const issuer = saved.tokens?.issuer;
+  if (!issuer) return skip('it does not say which server issued it');
   try {
     const info = await discoverOAuthServerInfo(url, { fetchFn });
+    if (!sameIssuer(issuer, String(info.authorizationServerUrl))) {
+      return skip(`${url.origin} now names another sign-in server than ${issuer}`);
+    }
     // OpenID discovery documents carry it too, though the SDK types only OAuth's.
     const meta = info.authorizationServerMetadata as { revocation_endpoint?: unknown } | undefined;
     const endpoint =
       typeof meta?.revocation_endpoint === 'string' ? meta.revocation_endpoint : undefined;
-    if (!endpoint) return;
-    if (!mayOpen(new URL(endpoint), url)) {
-      log(`not sending the sign-in to ${new URL(endpoint).origin} to revoke it: it is not https`);
-      return;
+    if (!endpoint) return skip('the server offers no revocation');
+    if (new URL(endpoint).origin !== new URL(issuer).origin) {
+      return skip(`its revocation endpoint is not on ${new URL(issuer).origin}`);
     }
     const body = new URLSearchParams({ token, token_type_hint: 'refresh_token' });
-    body.set('client_id', saved.client.client_id);
-    if (saved.client.client_secret) body.set('client_secret', saved.client.client_secret);
+    body.set('client_id', client.client_id);
+    if (client.client_secret) body.set('client_secret', client.client_secret);
     const r = await fetchFn(endpoint, { method: 'POST', body });
     log(
       r.ok
@@ -155,15 +179,13 @@ export const main = async (
     } catch {
       saved = undefined;
     }
-    if (saved && parsed.clientId) {
+    if (saved) {
       // The client the tokens were issued to, as signing in picks it.
-      saved.client = {
-        ...(saved.client?.client_id === parsed.clientId ? saved.client : {}),
-        client_id: parsed.clientId,
-        ...(parsed.clientSecret ? { client_secret: parsed.clientSecret } : {}),
-      };
+      const client = parsed.clientId
+        ? configuredClient(saved.client, parsed.clientId, parsed.clientSecret)
+        : saved.client;
+      await revoke(url, saved, fetchFn, log, client);
     }
-    if (saved) await revoke(url, saved, fetchFn, log);
     const existed = await store.remove(key);
     log(
       existed

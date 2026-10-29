@@ -39,7 +39,9 @@ const json = (res: ServerResponse, status: number, value: unknown, headers = {})
 
 const base64url = (b: Buffer) => b.toString('base64url');
 
-export const startFake = async (opts: { auth?: boolean; staticClient?: string } = {}) => {
+export const startFake = async (
+  opts: { auth?: boolean; staticClient?: string; revocationEndpoint?: string } = {},
+) => {
   const requireAuth = opts.auth ?? true;
   const clients = new Set<string>(opts.staticClient ? [opts.staticClient] : []);
   const codes = new Map<string, Pending>();
@@ -87,7 +89,7 @@ export const startFake = async (opts: { auth?: boolean; staticClient?: string } 
         authorization_endpoint: `${fake.base}/authorize`,
         token_endpoint: `${fake.base}/token`,
         registration_endpoint: `${fake.base}/register`,
-        revocation_endpoint: `${fake.base}/revoke`,
+        revocation_endpoint: opts.revocationEndpoint ?? `${fake.base}/revoke`,
         response_types_supported: ['code'],
         grant_types_supported: ['authorization_code', 'refresh_token'],
         code_challenge_methods_supported: ['S256'],
@@ -261,8 +263,10 @@ export const memoryStore = (): SecretStore & { entries: Map<string, string> } =>
     entries,
     where: 'memory',
     read: async (key) => entries.get(key),
-    write: async (key, value) => {
+    write: async (key, value, opts) => {
+      if (opts?.create === false && !entries.has(key)) return false;
       entries.set(key, value);
+      return true;
     },
     remove: async (key) => entries.delete(key),
   };

@@ -18,8 +18,16 @@ import type {
 import { clip } from './http.js';
 import { keyFor, type SecretStore } from './store.js';
 
-/** What a server gave the bridge, kept between runs. */
-export type Saved = { client?: OAuthClientInformationMixed; tokens?: OAuthTokens };
+/**
+ * What a server gave the bridge, kept between runs. The SDK stamps the client
+ * and the tokens with the `issuer` they came from.
+ */
+export type Saved = {
+  client?: OAuthClientInformationMixed;
+  /** The callback the client was registered with. */
+  redirectUrl?: string;
+  tokens?: OAuthTokens;
+};
 
 export type SignInOptions = {
   serverUrl: string;
@@ -53,6 +61,9 @@ type Flow = {
   server?: Server;
 };
 
+/** The entry as the store holds it now. */
+type Stored = { saved: Saved } | { absent: true } | { failed: true };
+
 const CLIENT_NAME = 'MCP Mesh Bridge';
 const TIMEOUT = 5 * 60_000;
 
@@ -69,6 +80,21 @@ export const isLoopback = (hostname: string): boolean =>
 export const mayOpen = (target: URL, server: URL): boolean =>
   target.protocol === 'https:' ||
   (target.protocol === 'http:' && (isLoopback(target.hostname) || server.protocol === 'http:'));
+
+/** A configured client, with what was saved for it, its secret only as configured now. */
+export const configuredClient = (
+  saved: OAuthClientInformationMixed | undefined,
+  clientId: string,
+  clientSecret?: string,
+): OAuthClientInformationMixed => {
+  const client: OAuthClientInformationMixed = {
+    ...(saved?.client_id === clientId ? saved : {}),
+    client_id: clientId,
+  };
+  if (clientSecret) client.client_secret = clientSecret;
+  else delete client.client_secret;
+  return client;
+};
 
 /** The S256 PKCE challenge of a verifier. */
 const challengeOf = (verifier: string): string =>
@@ -91,8 +117,8 @@ export const signIn = (opts: SignInOptions): SignIn => {
   /** Verifiers by their challenge: the opened URL's challenge picks its own. */
   const verifiers = new Map<string, string>();
 
-  /** The entry as stored now; one that cannot be read counts as none, and is said so. */
-  const readStore = async (): Promise<Saved | undefined> => {
+  /** An entry that is there but cannot be read is said so, and is not taken for a sign-out. */
+  const readStore = async (): Promise<Stored> => {
     let raw: string | undefined;
     try {
       raw = await opts.store.read(key);
@@ -100,51 +126,52 @@ export const signIn = (opts: SignInOptions): SignIn => {
       opts.log(
         `the stored sign-in for ${server.origin} could not be read (${clip((e as Error).message, 200)}); signing in again`,
       );
-      return undefined;
+      return { failed: true };
     }
-    if (raw === undefined) return undefined;
+    if (raw === undefined) return { absent: true };
     try {
-      return JSON.parse(raw) as Saved;
+      return { saved: JSON.parse(raw) as Saved };
     } catch {
       opts.log(`the stored sign-in for ${server.origin} is damaged; signing in again`);
-      return undefined;
+      return { failed: true };
     }
   };
 
-  const load = async (): Promise<Saved> => {
-    if (!saved) {
-      const s = await readStore();
-      stored = s !== undefined;
-      saved = s ?? {};
-    }
+  const adopt = (now: Stored): Saved => {
+    stored = 'saved' in now;
+    saved = 'saved' in now ? now.saved : {};
     return saved;
+  };
+
+  const load = async (): Promise<Saved> => saved ?? adopt(await readStore());
+
+  const signedOutMeanwhile = () => {
+    opts.log(`signed out of ${server.origin} meanwhile; not keeping what the server just sent`);
+    adopt({ absent: true });
   };
 
   /**
    * Change the entry as stored now, not as this process last saw it: an entry
-   * removed meanwhile, by `--logout`, stays removed.
+   * removed meanwhile, by `--logout`, stays removed; one that cannot be read
+   * is written over.
    */
   const persist = async (change: (s: Saved) => Saved): Promise<void> => {
     await load();
     const now = await readStore();
-    if (stored && now === undefined) {
-      opts.log(`signed out of ${server.origin} meanwhile; not keeping what the server just sent`);
-      saved = {};
-      stored = false;
+    if ('absent' in now && stored) return signedOutMeanwhile();
+    const base = 'saved' in now ? now.saved : {};
+    const next = change(base);
+    if (next === base && 'saved' in now) {
+      adopt(now);
       return;
     }
-    const next = change(now ?? {});
-    await opts.store.write(key, JSON.stringify(next));
+    const written = await opts.store.write(key, JSON.stringify(next), {
+      create: !('saved' in now),
+    });
+    if (!written) return signedOutMeanwhile();
     saved = next;
     stored = true;
   };
-
-  const staticClient: OAuthClientInformationMixed | undefined = opts.clientId
-    ? {
-        client_id: opts.clientId,
-        ...(opts.clientSecret ? { client_secret: opts.clientSecret } : {}),
-      }
-    : undefined;
 
   /** Stop listening and forget the flow; with `error`, whoever waits on it gets that. */
   const end = (error?: Error): void => {
@@ -232,21 +259,19 @@ export const signIn = (opts: SignInOptions): SignIn => {
     },
     state: () => (flow ??= newFlow()).state,
     clientInformation: async () => {
-      const s = await load();
-      if (staticClient) {
-        // The SDK saves a static client back with its issuer after first use;
-        // what is configured now wins over what was saved.
-        return s.client?.client_id === staticClient.client_id
-          ? { ...s.client, ...staticClient }
-          : staticClient;
-      }
-      // A client registered for another redirect URL, as with another port,
-      // cannot sign in here: register again.
-      const uris = s.client && 'redirect_uris' in s.client ? s.client.redirect_uris : undefined;
-      if (uris && !uris.includes(redirectUrl)) return undefined;
-      return s.client;
+      // Every `auth()` asks this first, before it refreshes: take up what
+      // another process stored meanwhile, such as a refresh token it rotated.
+      const s = adopt(await readStore());
+      if (opts.clientId) return configuredClient(s.client, opts.clientId, opts.clientSecret);
+      // A client registered for another callback, as with another port, cannot sign in here.
+      return s.redirectUrl === redirectUrl ? s.client : undefined;
     },
-    saveClientInformation: (client) => persist((s) => ({ ...s, client })),
+    saveClientInformation: (client) => {
+      const c = { ...client };
+      // A configured client's secret stays in the settings.
+      if (opts.clientId && c.client_id === opts.clientId) delete c.client_secret;
+      return persist((s) => ({ ...s, client: c, redirectUrl }));
+    },
     tokens: async () => (await load()).tokens,
     saveTokens: (tokens) => persist((s) => ({ ...s, tokens })),
     saveCodeVerifier: (verifier) => {
@@ -293,7 +318,15 @@ export const signIn = (opts: SignInOptions): SignIn => {
       } else if (scope === 'client') {
         await persist((s) => (s.tokens ? { tokens: s.tokens } : {}));
       } else if (scope === 'tokens') {
-        await persist((s) => (s.client ? { client: s.client } : {}));
+        // The server refused this process's refresh token. One another process
+        // stored since is newer: keep it, and the SDK's retry uses it.
+        const used = saved?.tokens?.refresh_token;
+        await persist((s) => {
+          if (s.tokens?.refresh_token !== used) return s;
+          const next = { ...s };
+          delete next.tokens;
+          return next;
+        });
       } else if (scope === 'discovery') {
         discovery = undefined;
       } else if (flow) {

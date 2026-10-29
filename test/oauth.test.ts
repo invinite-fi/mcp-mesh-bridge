@@ -20,8 +20,11 @@ const fake = async () => {
 };
 
 /** A sign-in to `serverUrl` with a browser that follows the redirect back. */
-const session = async (serverUrl: string, extra: Partial<SignInOptions> = {}) => {
-  const store = memoryStore();
+const session = async (
+  serverUrl: string,
+  extra: Partial<SignInOptions> = {},
+  store = memoryStore(),
+) => {
   const b = browser();
   const logs: string[] = [];
   const s = signIn({
@@ -115,27 +118,49 @@ test('a configured static client keeps what was saved with it', async () => {
     client_id_issued_at: 5,
   });
 
+  // The secret is the one configured now, or none.
+  const unset = await session(SERVER, { clientId: 'fixed' }, store);
+  assert.deepEqual(await unset.s.provider.clientInformation(), {
+    client_id: 'fixed',
+    client_id_issued_at: 5,
+  });
+
   const other = await session(SERVER, { clientId: 'fixed' });
   other.store.entries.set(key, JSON.stringify({ client: { client_id: 'registered' } }));
   assert.deepEqual(await other.s.provider.clientInformation(), { client_id: 'fixed' });
+
+  // What the SDK saves back for it keeps no secret: that stays in the settings.
+  await s.provider.saveClientInformation?.({ client_id: 'fixed', client_secret: 'new' });
+  const saved = JSON.parse(store.entries.get(key) ?? '{}') as { client?: object };
+  assert.deepEqual(saved.client, { client_id: 'fixed' });
 });
 
 test('a client registered for another callback port is registered again', async () => {
   const f = await fake();
   const { s, store, key } = await session(f.mcp.href);
+  // What the server echoes back is not what counts: the callback the bridge registered with is.
   store.entries.set(
     key,
     JSON.stringify({
-      client: { client_id: 'gone', redirect_uris: ['http://127.0.0.1:1/callback'] },
+      client: { client_id: 'gone', redirect_uris: [s.provider.redirectUrl] },
+      redirectUrl: 'http://127.0.0.1:1/callback',
     }),
   );
   await login(s, f.mcp);
   assert.equal(f.registrations, 1);
   const saved = JSON.parse(store.entries.get(key) ?? '{}') as {
-    client?: { client_id: string; redirect_uris?: string[] };
+    client?: { client_id: string };
+    redirectUrl?: string;
   };
   assert.equal(saved.client?.client_id, 'client-1');
-  assert.deepEqual(saved.client?.redirect_uris, [s.provider.redirectUrl]);
+  assert.equal(saved.redirectUrl, s.provider.redirectUrl);
+
+  // On the same port, the client is kept.
+  const port = Number(new URL(String(s.provider.redirectUrl)).port);
+  const again = await session(f.mcp.href, { port }, store);
+  await login(again.s, f.mcp);
+  assert.equal(f.registrations, 1);
+  assert.equal(again.b.opened.length, 0);
 });
 
 test('first sign-ins started together register one client and open one browser', async () => {
@@ -227,5 +252,76 @@ test('a sign-out while running is not undone by what the server sends next', asy
   await s.provider.saveTokens({ access_token: 'b', token_type: 'Bearer' });
   assert.equal(store.entries.size, 0);
   assert.match(logs.join('\n'), /signed out of https:\/\/mcp.example meanwhile/);
+  assert.equal(await s.provider.tokens(), undefined);
+});
+
+const ENTRY = JSON.stringify({
+  client: { client_id: 'c' },
+  tokens: { access_token: 'a', token_type: 'Bearer', refresh_token: 'r1' },
+});
+
+test('a sign-out between reading the entry and writing it is not undone', async () => {
+  const { s, store, key, logs } = await session(SERVER);
+  store.entries.set(key, ENTRY);
+  await s.provider.tokens();
+  // `--logout` runs right after the next read.
+  const read = store.read;
+  store.read = async (k) => {
+    const value = await read(k);
+    store.entries.clear();
+    return value;
+  };
+  await s.provider.saveTokens({ access_token: 'b', token_type: 'Bearer' });
+  assert.equal(store.entries.size, 0);
+  assert.match(logs.join('\n'), /meanwhile/);
+});
+
+test('an entry that cannot be read is written over, not taken for a sign-out', async () => {
+  const { s, store, key } = await session(SERVER);
+  store.entries.set(key, ENTRY);
+  await s.provider.tokens();
+  const read = store.read;
+  store.read = () => Promise.reject(new Error('the Keychain is locked'));
+  await s.provider.saveTokens({ access_token: 'b', token_type: 'Bearer' });
+  store.read = read;
+  const saved = JSON.parse(store.entries.get(key) ?? '{}') as { tokens?: { access_token: string } };
+  assert.equal(saved.tokens?.access_token, 'b');
+});
+
+test('a refresh token another process rotated is taken up', async () => {
+  const f = await fake();
+  const port = await freePort();
+  const one = await session(f.mcp.href, { port });
+  await login(one.s, f.mcp);
+  // A second process, started with the same sign-in.
+  const two = await session(f.mcp.href, { port }, one.store);
+  assert.ok(await two.s.provider.tokens());
+
+  // Each process has its own fetch: nothing is shared between them.
+  assert.equal(
+    await auth(one.s.provider, { serverUrl: f.mcp, fetchFn: guardedFetch() }),
+    'AUTHORIZED',
+  );
+  assert.equal(
+    await auth(two.s.provider, { serverUrl: f.mcp, fetchFn: guardedFetch() }),
+    'AUTHORIZED',
+  );
+  assert.deepEqual(f.grants, ['authorization_code', 'refresh_token', 'refresh_token']);
+  assert.equal(two.b.opened.length, 0);
+});
+
+test('a refused refresh token is forgotten only if it is still the one stored', async () => {
+  const { s, store, key } = await session(SERVER);
+  store.entries.set(key, ENTRY);
+  assert.equal((await s.provider.tokens())?.refresh_token, 'r1');
+  // Another process refreshed meanwhile.
+  const newer = ENTRY.replace('r1', 'r2');
+  store.entries.set(key, newer);
+  await s.provider.invalidateCredentials?.('tokens');
+  assert.equal(store.entries.get(key), newer);
+  assert.equal((await s.provider.tokens())?.refresh_token, 'r2');
+
+  await s.provider.invalidateCredentials?.('tokens');
+  assert.deepEqual(JSON.parse(store.entries.get(key) ?? '{}'), { client: { client_id: 'c' } });
   assert.equal(await s.provider.tokens(), undefined);
 });

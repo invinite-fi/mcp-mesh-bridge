@@ -69,8 +69,9 @@ node server/index.mjs https://mcp.example.internal/mcp --logout
 
 Run it from the extension's folder, or use `node build/src/main.js` from a clone of this repository.
 
-If the server offers token revocation, the bridge asks it to revoke the sign-in first. It then says
-whether anything was stored. A bridge still running doesn't store the sign-in again.
+If the server offers token revocation, the bridge asks it to revoke the sign-in first. It asks only
+the sign-in server that issued it, at that server's own address. It then says whether anything was
+stored. A bridge still running doesn't store the sign-in again.
 
 ## Command line
 
