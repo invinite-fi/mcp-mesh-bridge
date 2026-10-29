@@ -89,7 +89,8 @@ It writes its own messages to stderr only. Stdout carries MCP.
 
 ## A branded build
 
-An organisation can build its own copy, with its own name and its server's URL filled in:
+An organisation can build its own copy, with its own name and its server's URL built in. It asks
+nothing at install; the sign-in port is chosen from the URL.
 
 ```sh
 npm ci

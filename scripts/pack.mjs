@@ -5,9 +5,10 @@
 //   npm run pack:branded -- --name "Example Knowledge" --url https://mcp.example.internal/mcp \
 //     --out dist/example-knowledge.mcpb
 //
-// A branded build gets its own display name and the URL as the server URL's
-// default. Branded builds stay on the machine that made them: they are not
-// committed or released.
+// A branded build gets its own display name and its server URL built in, so it
+// asks nothing at install: Claude Desktop keeps a settings dialog's Save off
+// until a field changes, even when every default is good. Branded builds stay
+// on the machine that made them: they are not committed or released.
 import { execFileSync } from 'node:child_process';
 import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
@@ -34,7 +35,8 @@ if (values.name) {
 }
 if (values.url) {
   new URL(values.url);
-  manifest.user_config.server_url.default = values.url;
+  delete manifest.user_config;
+  manifest.server.mcp_config.env = { MCP_MESH_BRIDGE_URL: values.url };
 }
 
 const stage = join(root, 'dist', 'stage');
