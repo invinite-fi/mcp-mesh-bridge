@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { parse } from '../src/cli.js';
+import { main, parse } from '../src/cli.js';
 import { portFor } from '../src/port.js';
+import { keyFor } from '../src/store.js';
+import { memoryStore, startFake } from './fake.js';
 
 const URL_A = 'https://mcp.example.internal/mcp';
 
@@ -47,4 +49,55 @@ test('bad input is refused with a reason', () => {
   assert.ok('exit' in flag && /unknown option/.test(flag.message));
   const help = parse(['--help'], {});
   assert.ok('exit' in help && help.exit === 0);
+});
+
+test('logout revokes the refresh token and says what it removed', async () => {
+  const fake = await startFake();
+  try {
+    const store = memoryStore();
+    store.entries.set(
+      keyFor(fake.mcp.href),
+      JSON.stringify({
+        client: { client_id: 'client-x' },
+        tokens: { access_token: 'at', token_type: 'Bearer', refresh_token: 'rt-x' },
+      }),
+    );
+    const logs: string[] = [];
+    const log = (m: string) => void logs.push(m);
+    assert.equal(await main(['--logout', fake.mcp.href], {}, store, log), 0);
+    assert.deepEqual(fake.revoked, [{ token: 'rt-x', clientId: 'client-x' }]);
+    assert.equal(store.entries.size, 0);
+    assert.deepEqual(logs, [
+      'the server revoked the sign-in',
+      `signed out of ${fake.base}: its sign-in is gone from memory`,
+    ]);
+
+    logs.length = 0;
+    assert.equal(await main(['--logout', fake.mcp.href], {}, store, log), 0);
+    assert.equal(fake.revoked.length, 1);
+    assert.deepEqual(logs, [`nothing was stored for ${fake.base} in memory`]);
+
+    // A configured client is the one the tokens were issued to.
+    store.entries.set(
+      keyFor(fake.mcp.href),
+      JSON.stringify({
+        client: { client_id: 'client-x' },
+        tokens: { access_token: 'at', token_type: 'Bearer', refresh_token: 'rt-y' },
+      }),
+    );
+    await main(['--logout', fake.mcp.href, '--client-id', 'fixed'], {}, store, log);
+    assert.deepEqual(fake.revoked[1], { token: 'rt-y', clientId: 'fixed' });
+  } finally {
+    await fake.close();
+  }
+});
+
+test('plain http to another machine is warned about', async () => {
+  const logs: string[] = [];
+  const log = (m: string) => void logs.push(m);
+  await main(['--logout', 'http://mcp.mesh.example/mcp'], {}, memoryStore(), log);
+  assert.match(logs[0] ?? '', /^http:\/\/mcp.mesh.example is plain http/);
+  logs.length = 0;
+  await main(['--logout', 'http://127.0.0.1:9/mcp'], {}, memoryStore(), log);
+  assert.ok(!logs.some((m) => m.includes('plain http')));
 });

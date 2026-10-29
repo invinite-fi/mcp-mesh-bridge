@@ -14,6 +14,8 @@ export type Fake = {
   mcp: URL;
   registrations: number;
   grants: string[];
+  /** Tokens revoked, with the client that asked. */
+  revoked: { token: string; clientId: string }[];
   initializes: number;
   protocolVersions: string[];
   /** Access tokens the server takes, so a test can expire one. */
@@ -50,6 +52,7 @@ export const startFake = async (opts: { auth?: boolean; staticClient?: string } 
     mcp: new URL('http://127.0.0.1/'),
     registrations: 0,
     grants: [],
+    revoked: [],
     initializes: 0,
     protocolVersions: [],
     valid: new Set(),
@@ -84,6 +87,7 @@ export const startFake = async (opts: { auth?: boolean; staticClient?: string } 
         authorization_endpoint: `${fake.base}/authorize`,
         token_endpoint: `${fake.base}/token`,
         registration_endpoint: `${fake.base}/register`,
+        revocation_endpoint: `${fake.base}/revoke`,
         response_types_supported: ['code'],
         grant_types_supported: ['authorization_code', 'refresh_token'],
         code_challenge_methods_supported: ['S256'],
@@ -96,6 +100,14 @@ export const startFake = async (opts: { auth?: boolean; staticClient?: string } 
       const clientId = `client-${++fake.registrations}`;
       clients.add(clientId);
       json(res, 201, { ...meta, client_id: clientId, client_id_issued_at: 1 });
+      return;
+    }
+    if (path === '/revoke' && req.method === 'POST') {
+      const p = new URLSearchParams(await body(req));
+      const token = p.get('token') ?? '';
+      fake.revoked.push({ token, clientId: p.get('client_id') ?? '' });
+      refresh.delete(token);
+      res.writeHead(200).end();
       return;
     }
     if (path === '/authorize') {
@@ -252,9 +264,7 @@ export const memoryStore = (): SecretStore & { entries: Map<string, string> } =>
     write: async (key, value) => {
       entries.set(key, value);
     },
-    remove: async (key) => {
-      entries.delete(key);
-    },
+    remove: async (key) => entries.delete(key),
   };
 };
 

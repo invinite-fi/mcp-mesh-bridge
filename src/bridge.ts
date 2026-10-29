@@ -19,7 +19,7 @@ import {
   type RequestId,
 } from '@modelcontextprotocol/sdk/types.js';
 import type { SignIn } from './oauth.js';
-import { sharedRefresh } from './refresh.js';
+import { clip, guardedFetch } from './http.js';
 
 export type BridgeOptions = {
   url: URL;
@@ -45,17 +45,17 @@ const causeCode = (e: unknown): string | undefined => {
   return typeof cause?.code === 'string' ? cause.code : undefined;
 };
 
-/** A sentence for Claude and the log; never carries a token. */
+/** A sentence for Claude and the log, the server's own words cut short; never carries a token. */
 export const explain = (e: unknown, url: URL): string => {
   const code = causeCode(e);
   if (code && UNREACHABLE.has(code)) {
     return `Cannot reach ${url.origin} (${code}). Is the VPN or mesh connected?`;
   }
   if (e instanceof StreamableHTTPError) {
-    return `${url.origin} answered ${e.code ?? 'an error'}: ${e.message}`;
+    return clip(`${url.origin} answered ${e.code ?? 'an error'}: ${e.message}`);
   }
-  if (e instanceof UnauthorizedError) return `Not signed in to ${url.origin}: ${e.message}`;
-  return `${url.origin}: ${e instanceof Error ? e.message : String(e)}`;
+  if (e instanceof UnauthorizedError) return clip(`Not signed in to ${url.origin}: ${e.message}`);
+  return clip(`${url.origin}: ${e instanceof Error ? e.message : String(e)}`);
 };
 
 /** How long a transport replaced by a new session stays open for requests under way on it. */
@@ -79,12 +79,12 @@ export const bridge = async (local: Transport, opts: BridgeOptions): Promise<voi
   // Answers to the bridge's own requests, which Claude never sees.
   const waiting = new Map<RequestId, (m: JSONRPCMessage) => void>();
   // Shared by every transport the bridge opens, so a refresh is too.
-  const refreshOnce = sharedRefresh(opts.fetch);
+  const guarded = guardedFetch(opts.fetch);
 
   const open = async (): Promise<void> => {
     const t = new StreamableHTTPClientTransport(url, {
       authProvider: opts.signIn.provider,
-      fetch: refreshOnce,
+      fetch: guarded,
     });
     t.onmessage = (m) => {
       if (

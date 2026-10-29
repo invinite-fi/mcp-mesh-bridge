@@ -49,10 +49,15 @@ built for MCP clients do.
 
 What the server gives the bridge, its client registration and tokens, is kept per server URL:
 
-- **macOS:** in your login Keychain, under the service name `mcp-mesh-bridge`.
+- **macOS:** in `~/Library/Application Support/mcp-mesh-bridge/`, encrypted with AES-256-GCM. The
+  key is in your login Keychain, under the service name `mcp-mesh-bridge`.
 - **Windows:** in `%APPDATA%\mcp-mesh-bridge\`, encrypted with Windows' data protection for your
-  user account only.
-- **Elsewhere:** in `~/.config/mcp-mesh-bridge/`, readable by you only.
+  user account.
+- **Elsewhere:** in `~/.config/mcp-mesh-bridge/`.
+
+Only your user can read these folders and files. The bridge writes a file whole or not at all.
+
+If a stored sign-in can't be read, the bridge says so on stderr and signs you in again.
 
 ## Signing out
 
@@ -63,6 +68,9 @@ node server/index.mjs https://mcp.example.internal/mcp --logout
 ```
 
 Run it from the extension's folder, or use `node build/src/main.js` from a clone of this repository.
+
+If the server offers token revocation, the bridge asks it to revoke the sign-in first. It then says
+whether anything was stored. A bridge still running doesn't store the sign-in again.
 
 ## Command line
 
@@ -97,6 +105,26 @@ it names your private server.
 - It sends nothing anywhere but the server you configure and that server's sign-in.
 - It never writes a token to a log, and keeps no secret on a command line.
 - It has one runtime dependency, the official MCP TypeScript SDK, bundled into the extension.
+
+**The browser.** The bridge opens a sign-in address only if it is `https:`. It also opens `http:`
+when the address is on your own machine, or when the server URL is `http:` itself. It logs where
+the sign-in is. It starts the browser with a fixed program: `/usr/bin/open` on macOS,
+`rundll32.exe` from Windows' `System32`, or `xdg-open` from a system folder. It never runs a
+program found on `PATH`.
+
+**What the Keychain protects.** On macOS the key is a Keychain item that `/usr/bin/security`
+created. Any program running as you can read it with that same tool, without asking you. So the
+Keychain protects the stored sign-in only from a copy of the file taken elsewhere, such as a backup.
+Windows' data protection is the same: any program running as you can decrypt the file.
+
+**Plain http.** An `http:` server URL that isn't on your own machine gets a warning on stderr. The
+bridge still allows it, since a mesh network encrypts the traffic itself. Use `https:` anywhere
+else.
+
+**Limits.** The bridge refuses an answer over 32 MB, or one event over 32 MB in a stream. It cuts
+what the server says to 2 KB before it reaches a log or Claude.
+
+**Releases.** The `.mcpb` in a release isn't signed yet. Signing comes later.
 
 ## Development
 

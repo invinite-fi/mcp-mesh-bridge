@@ -2,8 +2,10 @@
 // (discovery, dynamic client registration, PKCE, refresh), with the browser
 // sent back to a loopback callback on this machine.
 import { spawn } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
+import { win32 } from 'node:path';
 import type {
   OAuthClientProvider,
   OAuthDiscoveryState,
@@ -13,10 +15,11 @@ import type {
   OAuthClientMetadata,
   OAuthTokens,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
+import { clip } from './http.js';
 import { keyFor, type SecretStore } from './store.js';
 
 /** What a server gave the bridge, kept between runs. */
-type Saved = { client?: OAuthClientInformationMixed; tokens?: OAuthTokens };
+export type Saved = { client?: OAuthClientInformationMixed; tokens?: OAuthTokens };
 
 export type SignInOptions = {
   serverUrl: string;
@@ -43,6 +46,7 @@ export type SignIn = {
 /** A browser sign-in under way. One at a time: a request meeting a 401 during it joins it. */
 type Flow = {
   state: string;
+  /** The verifier of the authorization URL that was opened. */
   verifier?: string;
   opened: boolean;
   code: Promise<string>;
@@ -52,28 +56,87 @@ type Flow = {
 const CLIENT_NAME = 'MCP Mesh Bridge';
 const TIMEOUT = 5 * 60_000;
 
+export const isLoopback = (hostname: string): boolean =>
+  hostname === 'localhost' ||
+  hostname === '::1' ||
+  hostname === '[::1]' ||
+  /^127\.\d+\.\d+\.\d+$/.test(hostname);
+
+/**
+ * Whether the browser may be sent to `target` to sign in to `server`: https,
+ * or http on this machine or when the server itself is plain http.
+ */
+export const mayOpen = (target: URL, server: URL): boolean =>
+  target.protocol === 'https:' ||
+  (target.protocol === 'http:' && (isLoopback(target.hostname) || server.protocol === 'http:'));
+
+/** The S256 PKCE challenge of a verifier. */
+const challengeOf = (verifier: string): string =>
+  createHash('sha256').update(verifier).digest('base64url');
+
 const page = (title: string, text: string): string =>
   `<!doctype html><meta charset="utf-8"><title>${title}</title>` +
   `<body style="font-family:system-ui;margin:3rem"><h1>${title}</h1><p>${text}</p></body>`;
 
 export const signIn = (opts: SignInOptions): SignIn => {
   const key = keyFor(opts.serverUrl);
+  const server = new URL(opts.serverUrl);
   const redirectUrl = `http://127.0.0.1:${opts.port}/callback`;
   let saved: Saved | undefined;
+  /** The store held an entry when this process last read or wrote it. */
+  let stored = false;
   let discovery: OAuthDiscoveryState | undefined;
   let flow: Flow | undefined;
   let settle: { resolve: (code: string) => void; reject: (e: Error) => void } | undefined;
+  /** Verifiers by their challenge: the opened URL's challenge picks its own. */
+  const verifiers = new Map<string, string>();
+
+  /** The entry as stored now; one that cannot be read counts as none, and is said so. */
+  const readStore = async (): Promise<Saved | undefined> => {
+    let raw: string | undefined;
+    try {
+      raw = await opts.store.read(key);
+    } catch (e) {
+      opts.log(
+        `the stored sign-in for ${server.origin} could not be read (${clip((e as Error).message, 200)}); signing in again`,
+      );
+      return undefined;
+    }
+    if (raw === undefined) return undefined;
+    try {
+      return JSON.parse(raw) as Saved;
+    } catch {
+      opts.log(`the stored sign-in for ${server.origin} is damaged; signing in again`);
+      return undefined;
+    }
+  };
 
   const load = async (): Promise<Saved> => {
     if (!saved) {
-      const raw = await opts.store.read(key);
-      saved = raw ? (JSON.parse(raw) as Saved) : {};
+      const s = await readStore();
+      stored = s !== undefined;
+      saved = s ?? {};
     }
     return saved;
   };
-  const persist = async (next: Saved): Promise<void> => {
-    saved = next;
+
+  /**
+   * Change the entry as stored now, not as this process last saw it: an entry
+   * removed meanwhile, by `--logout`, stays removed.
+   */
+  const persist = async (change: (s: Saved) => Saved): Promise<void> => {
+    await load();
+    const now = await readStore();
+    if (stored && now === undefined) {
+      opts.log(`signed out of ${server.origin} meanwhile; not keeping what the server just sent`);
+      saved = {};
+      stored = false;
+      return;
+    }
+    const next = change(now ?? {});
     await opts.store.write(key, JSON.stringify(next));
+    saved = next;
+    stored = true;
   };
 
   const staticClient: OAuthClientInformationMixed | undefined = opts.clientId
@@ -83,25 +146,36 @@ export const signIn = (opts: SignInOptions): SignIn => {
       }
     : undefined;
 
+  /** Stop listening and forget the flow; with `error`, whoever waits on it gets that. */
+  const end = (error?: Error): void => {
+    if (error) settle?.reject(error);
+    flow?.server?.closeAllConnections();
+    flow?.server?.close();
+    flow = undefined;
+    settle = undefined;
+    verifiers.clear();
+  };
+
   const newFlow = (): Flow => {
     const code = new Promise<string>((resolve, reject) => {
       const timer = setTimeout(
-        () => reject(new Error('the sign-in was not finished in time; try again')),
+        () => end(new Error('the sign-in was not finished in time; try again')),
         opts.timeout ?? TIMEOUT,
       );
+      timer.unref();
       settle = {
         resolve: (c) => (clearTimeout(timer), resolve(c)),
         reject: (e) => (clearTimeout(timer), reject(e)),
       };
     });
-    // A flow nobody waits on must not crash the process when it times out.
+    // A flow nobody waits on must not crash the process when it ends badly.
     code.catch(() => undefined);
     return { state: randomBytes(16).toString('hex'), opened: false, code };
   };
 
   const listen = (f: Flow): Promise<void> =>
     new Promise((resolve, reject) => {
-      const server = createServer((req, res) => {
+      const s = createServer((req, res) => {
         const url = new URL(req.url ?? '/', redirectUrl);
         if (url.pathname !== '/callback') {
           res.writeHead(404).end();
@@ -118,7 +192,7 @@ export const signIn = (opts: SignInOptions): SignIn => {
         const error = url.searchParams.get('error');
         if (error) {
           fail(400, 'The server did not sign you in. You can close this tab.');
-          settle?.reject(new Error(`the server refused the sign-in (${error})`));
+          end(new Error(`the server refused the sign-in (${clip(error, 100)})`));
           return;
         }
         const code = url.searchParams.get('code');
@@ -130,15 +204,15 @@ export const signIn = (opts: SignInOptions): SignIn => {
         res.end(page('Signed in', 'You can close this tab and return to Claude.'));
         settle?.resolve(code);
       });
-      server.once('error', (e: NodeJS.ErrnoException) =>
+      s.once('error', (e: NodeJS.ErrnoException) =>
         reject(
-          e.code === 'EADDRINUSE'
-            ? new Error(`port ${opts.port} is in use; choose another sign-in port`)
+          e.code === 'EADDRINUSE' || e.code === 'EACCES'
+            ? new Error(`port ${opts.port} cannot be used (${e.code}); choose another sign-in port`)
             : e,
         ),
       );
-      server.listen(opts.port, '127.0.0.1', () => {
-        f.server = server;
+      s.listen(opts.port, '127.0.0.1', () => {
+        f.server = s;
         resolve();
       });
     });
@@ -159,17 +233,25 @@ export const signIn = (opts: SignInOptions): SignIn => {
     state: () => (flow ??= newFlow()).state,
     clientInformation: async () => {
       const s = await load();
-      if (!staticClient) return s.client;
-      // The SDK saves a static client back with its issuer after first use.
-      return s.client?.client_id === staticClient.client_id ? s.client : staticClient;
+      if (staticClient) {
+        // The SDK saves a static client back with its issuer after first use;
+        // what is configured now wins over what was saved.
+        return s.client?.client_id === staticClient.client_id
+          ? { ...s.client, ...staticClient }
+          : staticClient;
+      }
+      // A client registered for another redirect URL, as with another port,
+      // cannot sign in here: register again.
+      const uris = s.client && 'redirect_uris' in s.client ? s.client.redirect_uris : undefined;
+      if (uris && !uris.includes(redirectUrl)) return undefined;
+      return s.client;
     },
-    saveClientInformation: async (client) => persist({ ...(await load()), client }),
+    saveClientInformation: (client) => persist((s) => ({ ...s, client })),
     tokens: async () => (await load()).tokens,
-    saveTokens: async (tokens) => persist({ ...(await load()), tokens }),
+    saveTokens: (tokens) => persist((s) => ({ ...s, tokens })),
     saveCodeVerifier: (verifier) => {
-      const f = (flow ??= newFlow());
-      // A request joining an opened flow keeps that flow's verifier.
-      if (!f.opened) f.verifier = verifier;
+      flow ??= newFlow();
+      verifiers.set(challengeOf(verifier), verifier);
     },
     codeVerifier: () => {
       if (!flow?.verifier) throw new Error('no sign-in is under way');
@@ -177,27 +259,41 @@ export const signIn = (opts: SignInOptions): SignIn => {
     },
     redirectToAuthorization: async (authorizationUrl) => {
       const f = (flow ??= newFlow());
+      // A request meeting a 401 during a sign-in joins it, keeping its verifier.
       if (f.opened) return;
+      if (!mayOpen(authorizationUrl, server)) {
+        const e = new Error(
+          `the sign-in is at ${authorizationUrl.protocol}//${authorizationUrl.host}, which is not https; not opening it`,
+        );
+        end(e);
+        throw e;
+      }
+      const verifier = verifiers.get(authorizationUrl.searchParams.get('code_challenge') ?? '');
+      if (!verifier) {
+        const e = new Error('the sign-in address carries no challenge this bridge made');
+        end(e);
+        throw e;
+      }
+      f.verifier = verifier;
       f.opened = true;
       try {
         await listen(f);
       } catch (e) {
-        settle?.reject(e as Error);
+        end(e as Error);
         throw e;
       }
-      opts.log(`signing in to ${new URL(opts.serverUrl).origin} in your browser`);
+      opts.log(`signing in to ${server.origin} at ${authorizationUrl.origin} in your browser`);
       opts.log(`if no browser opens, visit ${authorizationUrl.href}`);
       await opts.openBrowser(authorizationUrl.href);
     },
     invalidateCredentials: async (scope) => {
-      const s = await load();
       if (scope === 'all') {
         discovery = undefined;
-        await persist({});
+        await persist(() => ({}));
       } else if (scope === 'client') {
-        await persist(s.tokens ? { tokens: s.tokens } : {});
+        await persist((s) => (s.tokens ? { tokens: s.tokens } : {}));
       } else if (scope === 'tokens') {
-        await persist(s.client ? { client: s.client } : {});
+        await persist((s) => (s.client ? { client: s.client } : {}));
       } else if (scope === 'discovery') {
         discovery = undefined;
       } else if (flow) {
@@ -216,24 +312,40 @@ export const signIn = (opts: SignInOptions): SignIn => {
       if (!flow?.opened) return Promise.reject(new Error('no sign-in is under way'));
       return flow.code;
     },
-    done: () => {
-      flow?.server?.close();
-      flow = undefined;
-      settle = undefined;
-    },
+    done: () => end(),
   };
+};
+
+/** How to open a URL in the default browser here: a fixed binary, never one found on PATH. */
+export const browserCommand = (
+  url: string,
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+  exists: (path: string) => boolean = existsSync,
+): [string, string[]] | undefined => {
+  if (platform === 'darwin') return ['/usr/bin/open', [url]];
+  if (platform === 'win32') {
+    // rundll32 takes the URL whole; `cmd /c start` would split it at `&`.
+    return [
+      win32.join(env.SystemRoot ?? 'C:\\Windows', 'System32', 'rundll32.exe'),
+      ['url.dll,FileProtocolHandler', url],
+    ];
+  }
+  const xdg = ['/usr/bin/xdg-open', '/usr/local/bin/xdg-open', '/bin/xdg-open'].find((p) =>
+    exists(p),
+  );
+  return xdg ? [xdg, [url]] : undefined;
 };
 
 /** Open a URL in the default browser, without waiting for it. */
 export const openInBrowser = (url: string): void => {
-  const [command, args]: [string, string[]] =
-    process.platform === 'darwin'
-      ? ['open', [url]]
-      : process.platform === 'win32'
-        ? // rundll32 takes the URL whole; `cmd /c start` would split it at `&`.
-          ['rundll32', ['url.dll,FileProtocolHandler', url]]
-        : ['xdg-open', [url]];
-  const child = spawn(command, args, { detached: true, stdio: 'ignore', windowsHide: true });
+  const command = browserCommand(url);
+  if (!command) return;
+  const child = spawn(command[0], command[1], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
   child.on('error', () => undefined);
   child.unref();
 };

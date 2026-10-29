@@ -20,11 +20,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .node-version
           cache: npm
-      - run: npm ci
+      # Dependencies run no install scripts; esbuild finds its binary without one.
+      - run: npm ci --ignore-scripts
       - run: npm run validate
       - run: npm run pack
       - name: The packed bundle relays over stdio
@@ -40,15 +43,18 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .node-version
           cache: npm
-      - run: npm ci
+      # Dependencies run no install scripts; esbuild finds its binary without one.
+      - run: npm ci --ignore-scripts
       - name: The tag is the manifest's version
         run: test "v$(node -p "require('./manifest.json').version")" = "$GITHUB_REF_NAME"
       - run: npm run pack
       - name: Release the .mcpb
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.mcpb --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" dist/*.mcpb --title "$GITHUB_REF_NAME" --generate-notes
