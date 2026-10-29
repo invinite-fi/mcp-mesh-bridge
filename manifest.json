@@ -1,0 +1,71 @@
+{
+  "manifest_version": "0.3",
+  "name": "mcp-mesh-bridge",
+  "display_name": "MCP Mesh Bridge",
+  "version": "0.1.0",
+  "description": "Reach an MCP server on a private network from Claude Desktop, signing in with OAuth.",
+  "long_description": "Claude Desktop's connectors call MCP servers from Anthropic's cloud, which cannot reach a server on a VPN or a private mesh. This extension runs on your own machine instead: it relays Claude to the server's streamable-HTTP endpoint and back, and signs you in with OAuth in your browser. It knows no tools of its own; it passes on whatever the server offers.",
+  "author": {
+    "name": "Invinite Oy",
+    "url": "https://invinite.fi"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/invinite-fi/mcp-mesh-bridge.git"
+  },
+  "homepage": "https://github.com/invinite-fi/mcp-mesh-bridge",
+  "support": "https://github.com/invinite-fi/mcp-mesh-bridge/issues",
+  "license": "MIT",
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.mjs",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/index.mjs"],
+      "env": {
+        "MCP_MESH_BRIDGE_URL": "${user_config.server_url}",
+        "MCP_MESH_BRIDGE_PORT": "${user_config.callback_port}",
+        "MCP_MESH_BRIDGE_CLIENT_ID": "${user_config.client_id}",
+        "MCP_MESH_BRIDGE_CLIENT_SECRET": "${user_config.client_secret}"
+      }
+    }
+  },
+  "tools_generated": true,
+  "prompts_generated": true,
+  "keywords": ["mcp", "vpn", "private network", "oauth", "bridge"],
+  "compatibility": {
+    "platforms": ["darwin", "win32"],
+    "runtimes": {
+      "node": ">=20.0.0"
+    }
+  },
+  "user_config": {
+    "server_url": {
+      "type": "string",
+      "title": "Server URL",
+      "description": "The MCP server's streamable-HTTP address, such as https://mcp.example.internal/mcp.",
+      "required": true
+    },
+    "callback_port": {
+      "type": "number",
+      "title": "Sign-in port",
+      "description": "The port on this machine your browser returns to after signing in. Leave empty for one chosen from the server URL.",
+      "required": false,
+      "min": 1024,
+      "max": 65535
+    },
+    "client_id": {
+      "type": "string",
+      "title": "Client ID",
+      "description": "Only for a server that does not let clients register themselves: the client ID registered for this bridge.",
+      "required": false
+    },
+    "client_secret": {
+      "type": "string",
+      "title": "Client secret",
+      "description": "Only if that registered client has a secret.",
+      "required": false,
+      "sensitive": true
+    }
+  }
+}
