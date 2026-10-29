@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "mcp-mesh-bridge",
   "display_name": "MCP Mesh Bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Reach an MCP server on a private network from Claude Desktop, signing in with OAuth.",
   "long_description": "Claude Desktop's connectors call MCP servers from Anthropic's cloud, which cannot reach a server on a VPN or a private mesh. This extension runs on your own machine instead: it relays Claude to the server's streamable-HTTP endpoint and back, and signs you in with OAuth in your browser. It knows no tools of its own; it passes on whatever the server offers.",
   "author": {

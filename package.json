@@ -1,6 +1,6 @@
 {
   "name": "@invinite-fi/mcp-mesh-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A local bridge that lets Claude Desktop reach MCP servers on a private network, signing in with OAuth",
   "license": "MIT",
   "author": "Invinite Oy",
