@@ -95,11 +95,12 @@ nothing at install; the sign-in port is chosen from the URL.
 ```sh
 yarn install --immutable
 yarn bundle:branded --name "Example Knowledge" --url https://mcp.example.internal/mcp \
-  --icon icon.png --icon-dark icon-dark.png --out dist/example-knowledge.mcpb
+  --icon icon.png --out dist/example-knowledge.mcpb
 ```
 
-`--icon` is a square PNG, 512 px is plenty. `--icon-dark` is optional: a variant for a dark theme,
-for a logo that would vanish on one.
+`--icon` is a square PNG, 512 px is plenty. It has to read on light and dark themes alike: Claude's
+organisation allowlist accepts only one icon, as it refuses a manifest with themed `icons`. A logo
+that would vanish on one theme can sit on a tile of its own colour.
 
 Upload that file to your organisation's allowlist. Keep it out of this repository and its releases:
 it names your private server.

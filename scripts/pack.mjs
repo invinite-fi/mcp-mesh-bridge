@@ -3,7 +3,7 @@
 //
 //   yarn bundle
 //   yarn bundle:branded --name "Example Knowledge" --url https://mcp.example.internal/mcp \
-//     --icon icon.png --icon-dark icon-dark.png --out dist/example-knowledge.mcpb
+//     --icon icon.png --out dist/example-knowledge.mcpb
 //
 // A branded build gets its own display name and its server URL built in, so it
 // asks nothing at install: Claude Desktop keeps a settings dialog's Save off
@@ -22,19 +22,11 @@ const { values } = parseArgs({
     name: { type: 'string' },
     url: { type: 'string' },
     icon: { type: 'string' },
-    'icon-dark': { type: 'string' },
     out: { type: 'string' },
   },
 });
 
-// A PNG's width and height, from its IHDR chunk; a file that isn't a PNG is refused.
-const pngSize = (bytes, path) => {
-  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-  if (bytes.length < 24 || !bytes.subarray(0, 8).equals(signature)) {
-    throw new Error(`${path} is not a PNG`);
-  }
-  return `${bytes.readUInt32BE(16)}x${bytes.readUInt32BE(20)}`;
-};
+const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 const manifest = JSON.parse(await readFile(join(root, 'manifest.json'), 'utf8'));
 if (values.name) {
@@ -69,22 +61,14 @@ await build({
   logLevel: 'warning',
 });
 
-// An icon, and optionally a variant for a dark theme, which a host shows where
-// it supports themed icons; the plain `icon` is for the others.
-if (values['icon-dark'] && !values.icon) throw new Error('--icon-dark needs --icon');
+// One `icon`: Claude's organisation allowlist checks a manifest against the DXT
+// schema, which refuses the newer themed `icons`. A logo that would vanish on a
+// dark theme belongs on a tile of its own colour.
 if (values.icon) {
-  const light = await readFile(resolve(values.icon));
-  const size = pngSize(light, values.icon);
-  await writeFile(join(stage, 'icon.png'), light);
+  const icon = await readFile(resolve(values.icon));
+  if (!icon.subarray(0, 8).equals(PNG)) throw new Error(`${values.icon} is not a PNG`);
+  await writeFile(join(stage, 'icon.png'), icon);
   manifest.icon = 'icon.png';
-  if (values['icon-dark']) {
-    const dark = await readFile(resolve(values['icon-dark']));
-    await writeFile(join(stage, 'icon-dark.png'), dark);
-    manifest.icons = [
-      { src: 'icon.png', size, theme: 'light' },
-      { src: 'icon-dark.png', size: pngSize(dark, values['icon-dark']), theme: 'dark' },
-    ];
-  }
 }
 
 await writeFile(join(stage, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
