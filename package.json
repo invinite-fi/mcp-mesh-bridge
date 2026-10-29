@@ -1,0 +1,46 @@
+{
+  "name": "@invinite-fi/mcp-mesh-bridge",
+  "version": "0.1.0",
+  "description": "A local bridge that lets Claude Desktop reach MCP servers on a private network, signing in with OAuth",
+  "license": "MIT",
+  "author": "Invinite Oy",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/invinite-fi/mcp-mesh-bridge.git"
+  },
+  "private": true,
+  "type": "module",
+  "bin": "build/src/main.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --check .",
+    "format:fix": "prettier --write .",
+    "test": "yarn build && node --test \"build/test/*.test.js\"",
+    "validate": "yarn typecheck && yarn lint && yarn format && yarn test",
+    "bundle": "node scripts/pack.mjs",
+    "bundle:branded": "node scripts/pack.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1"
+  },
+  "devDependencies": {
+    "@anthropic-ai/mcpb": "2.1.2",
+    "@eslint/js": "10.0.1",
+    "@types/node": "22.20.5",
+    "esbuild": "0.28.2",
+    "eslint": "10.12.0",
+    "globals": "17.13.0",
+    "prettier": "3.9.10",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.71.2"
+  },
+  "packageManager": "yarn@4.18.1",
+  "resolutions": {
+    "@modelcontextprotocol/sdk/zod": "4.6.7"
+  }
+}
