@@ -70,6 +70,16 @@ test('writes to one entry are made in turn', () =>
     assert.equal(await store.read('k'), BIG);
   }));
 
+test('two processes writing one entry at once both succeed', () =>
+  scratch(async (dir) => {
+    // Two stores stand for two processes: each queues only its own writes.
+    const stores = [fileStore(dir), fileStore(dir)];
+    const values = Array.from({ length: 10 }, (_, i) => `${BIG}${i}`);
+    await Promise.all(values.map((v, i) => stores[i % 2]?.write('k', v)));
+    assert.ok(values.includes((await stores[0]?.read('k')) ?? ''));
+    assert.deepEqual(await readdir(dir), ['k.json']);
+  }));
+
 test('an entry that cannot be read is an error, not an empty one', () =>
   scratch(async (dir) => {
     await mkdir(join(dir, 'k.json'));

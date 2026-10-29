@@ -124,6 +124,20 @@ const sweep = async (dir: string): Promise<void> => {
   );
 };
 
+/** Rename over `to`; Windows refuses for a moment while another process replaces it, so try again. */
+const renameOver = async (from: string, to: string): Promise<void> => {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await rename(from, to);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code ?? '';
+      const busy = process.platform === 'win32' && ['EPERM', 'EACCES', 'EBUSY'].includes(code);
+      if (!busy || attempt === 10) throw e;
+      await new Promise((r) => setTimeout(r, 10 * attempt));
+    }
+  }
+};
+
 /** Write `name` in `dir` whole or not at all, readable by its owner only. */
 export const writeAtomic = async (dir: string, name: string, data: string): Promise<void> => {
   await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -133,7 +147,7 @@ export const writeAtomic = async (dir: string, name: string, data: string): Prom
   try {
     await writeFile(temp, data, { encoding: 'utf8', mode: 0o600 });
     await chmod(temp, 0o600);
-    await rename(temp, join(dir, name));
+    await renameOver(temp, join(dir, name));
   } catch (e) {
     await rm(temp, { force: true });
     throw e;
