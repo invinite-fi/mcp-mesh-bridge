@@ -9,6 +9,12 @@ on:
 permissions:
   contents: read
 
+# Bash on every runner, Windows included, so that the vendored Yarn is found by
+# its glob whatever its version.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   validate:
     # A public repository: GitHub-hosted runners only, never self-hosted ones,
@@ -25,11 +31,14 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .node-version
-          cache: npm
-      # Dependencies run no install scripts; esbuild finds its binary without one.
-      - run: npm ci --ignore-scripts
-      - run: npm run validate
-      - run: npm run pack
+      # The vendored Yarn. Dependencies run no install scripts (.yarnrc.yml), and
+      # esbuild finds its binary without one.
+      - run: node .yarn/releases/yarn-*.cjs install --immutable
+      - run: node .yarn/releases/yarn-*.cjs validate
+      - name: No known vulnerability in what ships
+        if: matrix.os == 'ubuntu-latest'
+        run: node .yarn/releases/yarn-*.cjs npm audit --environment production
+      - run: node .yarn/releases/yarn-*.cjs bundle
       - name: The packed bundle relays over stdio
         run: node --test build/test/stdio.test.js
         env:
@@ -48,12 +57,10 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .node-version
-          cache: npm
-      # Dependencies run no install scripts; esbuild finds its binary without one.
-      - run: npm ci --ignore-scripts
+      - run: node .yarn/releases/yarn-*.cjs install --immutable
       - name: The tag is the manifest's version
         run: test "v$(node -p "require('./manifest.json').version")" = "$GITHUB_REF_NAME"
-      - run: npm run pack
+      - run: node .yarn/releases/yarn-*.cjs bundle
       - name: Release the .mcpb
         env:
           GH_TOKEN: ${{ github.token }}

@@ -93,8 +93,8 @@ An organisation can build its own copy, with its own name and its server's URL b
 nothing at install; the sign-in port is chosen from the URL.
 
 ```sh
-npm ci
-npm run pack:branded -- --name "Example Knowledge" --url https://mcp.example.internal/mcp \
+yarn install --immutable
+yarn bundle:branded --name "Example Knowledge" --url https://mcp.example.internal/mcp \
   --out dist/example-knowledge.mcpb
 ```
 
@@ -131,10 +131,13 @@ what the server says to 2 KB before it reaches a log or Claude.
 ## Development
 
 ```sh
-npm ci
-npm run validate   # typecheck, lint, format check, tests
-npm run pack       # dist/mcp-mesh-bridge-<version>.mcpb
+yarn install --immutable
+yarn validate   # typecheck, lint, format check, tests
+yarn bundle     # dist/mcp-mesh-bridge-<version>.mcpb
 ```
+
+Yarn is vendored in `.yarn/releases`: any installed Yarn runs that version, and without one,
+`node .yarn/releases/yarn-*.cjs` does. Dependencies run no install scripts.
 
 A `v*` tag that matches `manifest.json`'s version publishes the `.mcpb` as a GitHub release.
 

@@ -1,8 +1,8 @@
 // Build the .mcpb: the bridge bundled into one file with esbuild, the
 // manifest, and the license, packed by Anthropic's mcpb CLI.
 //
-//   npm run pack
-//   npm run pack:branded -- --name "Example Knowledge" --url https://mcp.example.internal/mcp \
+//   yarn bundle
+//   yarn bundle:branded --name "Example Knowledge" --url https://mcp.example.internal/mcp \
 //     --out dist/example-knowledge.mcpb
 //
 // A branded build gets its own display name and its server URL built in, so it
