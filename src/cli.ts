@@ -11,7 +11,7 @@ import { configuredClient, isLoopback, openInBrowser, signIn, type Saved } from 
 import { portFor } from './port.js';
 import { keyFor, platformStore, type SecretStore } from './store.js';
 
-export const VERSION = '0.1.0';
+export const VERSION = '0.1.3';
 
 export const USAGE = `mcp-mesh-bridge ${VERSION}
 Relays Claude Desktop to an MCP server on a private network, signing in with OAuth.
