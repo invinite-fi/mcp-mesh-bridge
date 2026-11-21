@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
@@ -23,9 +26,10 @@ const connect = async (
   url: URL,
   store: SecretStore,
   open: (u: string) => Promise<void>,
-  extra: { clientId?: string } = {},
+  extra: { clientId?: string; pickFile?: () => Promise<string | undefined> } = {},
 ): Promise<Claude> => {
   const [claude, side] = InMemoryTransport.createLinkedPair();
+  const { pickFile, ...signInExtra } = extra;
   const session = signIn({
     serverUrl: url.href,
     port: await freePort(),
@@ -33,9 +37,14 @@ const connect = async (
     openBrowser: open,
     log: () => undefined,
     timeout: 10_000,
-    ...extra,
+    ...signInExtra,
   });
-  const running = bridge(side, { url, signIn: session, log: () => undefined });
+  const running = bridge(side, {
+    url,
+    signIn: session,
+    log: () => undefined,
+    ...(pickFile ? { pickFile } : {}),
+  });
   const answers = new Map<string | number, (m: JSONRPCMessage) => void>();
   claude.onmessage = (m) => {
     if ('id' in m && m.id !== undefined && !('method' in m)) answers.get(m.id)?.(m);
@@ -168,4 +177,148 @@ test('an unreachable server is answered with a sentence about the network', asyn
   assert.ok('error' in answer, JSON.stringify(answer));
   assert.match(answer.error.message, /Cannot reach http:\/\/127\.0\.0\.1:\d+ \(ECONNREFUSED\)/);
   assert.match(answer.error.message, /VPN or mesh/);
+});
+
+test('advertises upload_local_file when the server offers start_upload and streams files from disk', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mcp-mesh-bridge-e2e-'));
+  cleanups.push(() => rm(dir, { recursive: true, force: true }));
+  const sample = join(dir, 'Proposal.pdf');
+  const bytes = Buffer.from('%PDF-1.7\nhello binary upload\n');
+  await writeFile(sample, bytes);
+
+  const fake = await started({ uploads: true });
+  const claude = await connect(fake.mcp, memoryStore(), browser().open, {
+    pickFile: async () => sample,
+  });
+  await initialize(claude);
+  await claude.notify('notifications/initialized');
+
+  const tools = result(await claude.request('tools/list')).tools as { name: string }[];
+  assert.deepEqual(
+    tools.map((t) => t.name),
+    ['echo', 'start_upload', 'upload_local_file'],
+  );
+
+  // 1. Upload by explicit local path (with keep flag).
+  const byPath = result(
+    await claude.request('tools/call', {
+      name: 'upload_local_file',
+      arguments: { path: sample, keep: true },
+    }),
+  ) as { isError?: boolean; content: { text: string }[] };
+  assert.notEqual(byPath.isError, true, byPath.content[0]?.text);
+  const match1 = /upload_id: (\S+)/.exec(byPath.content[0]?.text ?? '');
+  assert.ok(match1?.[1]);
+  const stored1 = fake.uploaded.get(match1[1]);
+  assert.equal(stored1?.filename, 'Proposal.pdf');
+  assert.deepEqual(stored1?.bytes, bytes);
+  assert.equal(stored1?.keep, true);
+
+  // 2. Upload via native picker fallback (path omitted), even across a forgotten session.
+  fake.forget();
+  const byPicker = result(
+    await claude.request('tools/call', {
+      name: 'upload_local_file',
+      arguments: {},
+    }),
+  ) as { isError?: boolean; content: { text: string }[] };
+  assert.notEqual(byPicker.isError, true, byPicker.content[0]?.text);
+  const match2 = /upload_id: (\S+)/.exec(byPicker.content[0]?.text ?? '');
+  assert.ok(match2?.[1]);
+  assert.deepEqual(fake.uploaded.get(match2[1])?.bytes, bytes);
+  assert.equal(fake.initializes, 2, 'recovered forgotten session for bridge call');
+});
+
+test('refuses cross-origin upload_url returned by a server', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mcp-mesh-bridge-xorigin-'));
+  cleanups.push(() => rm(dir, { recursive: true, force: true }));
+  const sample = join(dir, 'Deck.pptx');
+  await writeFile(sample, 'PK\x03\x04deck');
+
+  const fake = await started({ uploads: true, uploadUrlOrigin: 'https://other.example' });
+  const claude = await connect(fake.mcp, memoryStore(), browser().open);
+  await initialize(claude);
+  await claude.notify('notifications/initialized');
+
+  const res = result(
+    await claude.request('tools/call', {
+      name: 'upload_local_file',
+      arguments: { path: sample },
+    }),
+  ) as { isError?: boolean; content: { text: string }[] };
+  assert.equal(res.isError, true);
+  assert.match(res.content[0]?.text ?? '', /only uploads to/);
+  assert.equal(fake.uploaded.size, 0);
+});
+
+test('refuses upload_local_file without touching the picker or filesystem when start_upload is absent', async () => {
+  const fake = await started({ uploads: false });
+  let pickerCalled = false;
+  const claude = await connect(fake.mcp, memoryStore(), browser().open, {
+    pickFile: async () => {
+      pickerCalled = true;
+      return '/tmp/should-not-be-picked.pdf';
+    },
+  });
+  await initialize(claude);
+  await claude.notify('notifications/initialized');
+
+  const res = result(
+    await claude.request('tools/call', {
+      name: 'upload_local_file',
+      arguments: {},
+    }),
+  ) as { isError?: boolean; content: { text: string }[] };
+  assert.equal(res.isError, true);
+  assert.match(res.content[0]?.text ?? '', /does not support upload_local_file/);
+  assert.equal(pickerCalled, false, 'must not open file picker when server lacks start_upload');
+});
+
+test('relays upload_local_file to the server when the server defines its own upload_local_file tool', async () => {
+  const fake = await started({ uploads: true, ownUploadTool: true });
+  const claude = await connect(fake.mcp, memoryStore(), browser().open);
+  await initialize(claude);
+  await claude.notify('notifications/initialized');
+
+  const tools = result(await claude.request('tools/list')).tools as { name: string }[];
+  assert.deepEqual(
+    tools.map((t) => t.name),
+    ['echo', 'start_upload', 'upload_local_file'],
+  );
+
+  const res = result(
+    await claude.request('tools/call', {
+      name: 'upload_local_file',
+      arguments: { custom: 'arg' },
+    }),
+  ) as { isError?: boolean; content: { text: string }[] };
+  assert.notEqual(res.isError, true);
+  assert.equal(res.content[0]?.text, 'server-handled:{"custom":"arg"}');
+});
+
+test('augments paginated tools/list only on the page that offers start_upload', async () => {
+  const fake = await started({ uploads: true, paginatedTools: true });
+  const claude = await connect(fake.mcp, memoryStore(), browser().open);
+  await initialize(claude);
+  await claude.notify('notifications/initialized');
+
+  const page1 = result(await claude.request('tools/list')) as {
+    tools: { name: string }[];
+    nextCursor?: string;
+  };
+  assert.deepEqual(
+    page1.tools.map((t) => t.name),
+    ['echo'],
+  );
+  assert.equal(page1.nextCursor, 'page-2');
+
+  const page2 = result(await claude.request('tools/list', { cursor: page1.nextCursor })) as {
+    tools: { name: string }[];
+    nextCursor?: string;
+  };
+  assert.deepEqual(
+    page2.tools.map((t) => t.name),
+    ['start_upload', 'upload_local_file'],
+  );
+  assert.equal(page2.nextCursor, undefined);
 });

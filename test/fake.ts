@@ -20,17 +20,21 @@ export type Fake = {
   protocolVersions: string[];
   /** Access tokens the server takes, so a test can expire one. */
   valid: Set<string>;
+  /** Binary uploads received via PUT `/uploads/direct/<id>/<token>`. */
+  uploaded: Map<string, { filename: string; bytes: Buffer; keep?: boolean }>;
   /** Forget every session, as a restarted server would. */
   forget: () => void;
   close: () => Promise<void>;
 };
 
-const body = (req: IncomingMessage): Promise<string> =>
+const rawBody = (req: IncomingMessage): Promise<Buffer> =>
   new Promise((resolve) => {
-    let data = '';
-    req.on('data', (c: Buffer) => (data += c.toString('utf8')));
-    req.on('end', () => resolve(data));
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
   });
+
+const body = async (req: IncomingMessage): Promise<string> => (await rawBody(req)).toString('utf8');
 
 const json = (res: ServerResponse, status: number, value: unknown, headers = {}) => {
   res.writeHead(status, { 'content-type': 'application/json', ...headers });
@@ -40,13 +44,25 @@ const json = (res: ServerResponse, status: number, value: unknown, headers = {})
 const base64url = (b: Buffer) => b.toString('base64url');
 
 export const startFake = async (
-  opts: { auth?: boolean; staticClient?: string; revocationEndpoint?: string } = {},
+  opts: {
+    auth?: boolean;
+    staticClient?: string;
+    revocationEndpoint?: string;
+    uploads?: boolean;
+    uploadUrlOrigin?: string;
+    ownUploadTool?: boolean;
+    paginatedTools?: boolean;
+  } = {},
 ) => {
   const requireAuth = opts.auth ?? true;
   const clients = new Set<string>(opts.staticClient ? [opts.staticClient] : []);
   const codes = new Map<string, Pending>();
   const refresh = new Map<string, string>();
   const sessions = new Set<string>();
+  const pendingUploads = new Map<
+    string,
+    { token: string; filename: string; bytes: number; keep?: boolean }
+  >();
   let n = 0;
 
   const fake: Fake = {
@@ -58,6 +74,7 @@ export const startFake = async (
     initializes: 0,
     protocolVersions: [],
     valid: new Set(),
+    uploaded: new Map(),
     forget: () => sessions.clear(),
     close: async () => undefined,
   };
@@ -207,19 +224,83 @@ export const startFake = async (
         return;
       }
       if (msg.method === 'tools/list') {
+        const params = msg.params as { cursor?: string } | undefined;
+        if (opts.paginatedTools && !params?.cursor) {
+          json(res, 200, {
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: {
+              tools: [{ name: 'echo', inputSchema: { type: 'object' } }],
+              nextCursor: 'page-2',
+            },
+          });
+          return;
+        }
+        const tools = opts.paginatedTools
+          ? []
+          : [{ name: 'echo', inputSchema: { type: 'object' } }];
+        if (opts.uploads) {
+          tools.push({ name: 'start_upload', inputSchema: { type: 'object' } });
+        }
+        if (opts.ownUploadTool) {
+          tools.push({ name: 'upload_local_file', inputSchema: { type: 'object' } });
+        }
         json(res, 200, {
           jsonrpc: '2.0',
           id: msg.id,
-          result: { tools: [{ name: 'echo', inputSchema: { type: 'object' } }] },
+          result: { tools },
         });
         return;
       }
       if (msg.method === 'tools/call') {
-        const args = (msg.params as { arguments?: unknown }).arguments;
+        const params = msg.params as { name?: string; arguments?: Record<string, unknown> };
+        if (opts.ownUploadTool && params.name === 'upload_local_file') {
+          json(res, 200, {
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: {
+              content: [
+                {
+                  type: 'text',
+                  text: `server-handled:${JSON.stringify(params.arguments)}`,
+                },
+              ],
+            },
+          });
+          return;
+        }
+        if (opts.uploads && params.name === 'start_upload') {
+          const filename = String(params.arguments?.filename ?? '');
+          const bytes = Number(params.arguments?.bytes ?? 0);
+          const keep =
+            typeof params.arguments?.keep === 'boolean' ? params.arguments.keep : undefined;
+          const id = `up-${++n}`;
+          const tok = `tok-${n}`;
+          pendingUploads.set(id, {
+            token: tok,
+            filename,
+            bytes,
+            ...(keep !== undefined ? { keep } : {}),
+          });
+          const origin = opts.uploadUrlOrigin ?? fake.base;
+          json(res, 200, {
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: {
+              content: [
+                {
+                  type: 'text',
+                  text: `upload_id: ${id}\nupload_url: ${origin}/uploads/direct/${id}/${tok}\n`,
+                },
+              ],
+            },
+          });
+          return;
+        }
         json(res, 200, {
           jsonrpc: '2.0',
           id: msg.id,
-          result: { content: [{ type: 'text', text: JSON.stringify(args) }] },
+          result: { content: [{ type: 'text', text: JSON.stringify(params.arguments) }] },
         });
         return;
       }
@@ -228,6 +309,28 @@ export const startFake = async (
         id: msg.id,
         error: { code: -32601, message: 'Method not found' },
       });
+      return;
+    }
+    if (opts.uploads && req.method === 'PUT' && path.startsWith('/uploads/direct/')) {
+      const parts = path.slice('/uploads/direct/'.length).split('/');
+      const [id, tok] = parts;
+      const pending = id ? pendingUploads.get(id) : undefined;
+      if (!pending || pending.token !== tok) {
+        res.writeHead(404).end();
+        return;
+      }
+      pendingUploads.delete(id!);
+      const data = await rawBody(req);
+      if (data.length !== pending.bytes) {
+        json(res, 400, { error: `${data.length} of ${pending.bytes} bytes arrived` });
+        return;
+      }
+      fake.uploaded.set(id!, {
+        filename: pending.filename,
+        bytes: data,
+        ...(pending.keep !== undefined ? { keep: pending.keep } : {}),
+      });
+      json(res, 200, { id, state: 'waiting' });
       return;
     }
     res.writeHead(404).end();

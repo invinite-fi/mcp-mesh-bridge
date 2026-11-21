@@ -12,7 +12,10 @@ This bridge runs on your own machine instead. Claude Desktop starts it as a loca
 passes every message on to the server's streamable-HTTP endpoint, unchanged, and passes the answers
 back. Your machine is on the private network, so the server is in reach.
 
-The bridge knows no tools of its own. Whatever the server offers, Claude sees.
+The bridge knows no domain tools of its own: whatever the server offers, Claude sees. When a
+server offers `start_upload` for single-use direct HTTP PUT uploads, the bridge automatically adds
+`upload_local_file` so Claude Desktop can stream a local file from disk (via the native OS file
+picker or an explicit path) straight to that server without passing file bytes through the chat.
 
 ## Install
 
@@ -112,11 +115,13 @@ it names your private server.
 - It never writes a token to a log, and keeps no secret on a command line.
 - It has one runtime dependency, the official MCP TypeScript SDK, bundled into the extension.
 
-**The browser.** The bridge opens a sign-in address only if it is `https:`. It also opens `http:`
-when the address is on your own machine, or when the server URL is `http:` itself. It logs where
-the sign-in is. It starts the browser with a fixed program: `/usr/bin/open` on macOS,
-`rundll32.exe` from Windows' `System32`, or `xdg-open` from a system folder. It never runs a
-program found on `PATH`.
+**The browser and file picker.** The bridge opens a sign-in address only if it is `https:`. It also
+opens `http:` when the address is on your own machine, or when the server URL is `http:` itself. It
+logs where the sign-in is. It starts the browser and the native file picker with fixed system
+programs: `/usr/bin/open` and `/usr/bin/osascript` on macOS, `rundll32.exe` and Windows PowerShell
+from `System32` on Windows, or `xdg-open` / `zenity` / `kdialog` from a system folder on Linux. It
+never runs a program found on `PATH`. `upload_local_file` only streams to the configured server's
+own origin, never follows redirects, and never writes upload URLs or tokens to a log.
 
 **What the Keychain protects.** On macOS the key is a Keychain item that `/usr/bin/security`
 created. Any program running as you can read it with that same tool, without asking you. So the
