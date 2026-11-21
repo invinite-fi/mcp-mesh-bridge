@@ -24,6 +24,38 @@ const PICKER_TIMEOUT_MS = 5 * 60_000;
 /** Maximum stdout/stderr bytes buffered from the native file picker process. */
 const MAX_PICKER_OUTPUT = 64 * 1024;
 
+/**
+ * The `_meta` key a server may set on its `start_upload` to say it implements
+ * this upload flow, whatever its schema: `{ "version": 1 }`.
+ */
+export const UPLOAD_META_KEY = 'fi.invinite/mcp-mesh-bridge-upload';
+/** The version of the upload flow this bridge speaks. */
+export const UPLOAD_META_VERSION = 1;
+
+const typeIs = (property: unknown, ...types: string[]): boolean => {
+  const t = (property as { type?: unknown } | undefined)?.type;
+  return Array.isArray(t)
+    ? t.some((x) => typeof x === 'string' && types.includes(x))
+    : typeof t === 'string' && types.includes(t);
+};
+
+/**
+ * Whether `tool` is a `start_upload` the bridge can drive: named so, and either
+ * marked in its `_meta` with a version of the flow the bridge speaks, or
+ * taking a string `filename` and a numeric `bytes`. A tool of that name for
+ * something else gets no `upload_local_file`.
+ */
+export const isUploadStart = (tool: Tool | undefined): boolean => {
+  if (!tool || typeof tool !== 'object' || tool.name !== REMOTE_START_UPLOAD) return false;
+  const marker = (tool._meta as Record<string, unknown> | undefined)?.[UPLOAD_META_KEY];
+  if (marker !== undefined) {
+    return (marker as { version?: unknown } | null)?.version === UPLOAD_META_VERSION;
+  }
+  const props = (tool.inputSchema as { properties?: Record<string, unknown> } | undefined)
+    ?.properties;
+  return typeIs(props?.filename, 'string') && typeIs(props?.bytes, 'integer', 'number');
+};
+
 /** What the bridge itself fills in of `start_upload`'s arguments, from the file. */
 const BRIDGE_START_ARGS = new Set(['filename', 'bytes']);
 /** The bridge's own argument, never passed on to `start_upload`. */

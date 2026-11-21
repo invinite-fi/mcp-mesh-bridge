@@ -7,6 +7,8 @@ import {
   handleUploadLocalFile,
   parseStartUpload,
   parseStartUploadResult,
+  isUploadStart,
+  UPLOAD_META_KEY,
   rememberUploadUrl,
   uploadLocalFileTool,
   pickerCommand,
@@ -377,4 +379,47 @@ test('handleUploadLocalFile passes on structuredContent.next alone when the serv
   assert.match(said, /upload_id: u-1/);
   assert.match(said, /Then call store_it/);
   assert.doesNotMatch(said, /curl|TOK/);
+});
+
+test('isUploadStart takes a start_upload by its schema or its marker, not by name alone', () => {
+  const schema = (properties: Record<string, object>) => ({ type: 'object' as const, properties });
+  const ok = schema({ filename: { type: 'string' }, bytes: { type: 'integer' } });
+  assert.equal(isUploadStart({ name: 'start_upload', inputSchema: ok }), true);
+  assert.equal(
+    isUploadStart({
+      name: 'start_upload',
+      inputSchema: schema({ filename: { type: ['string', 'null'] }, bytes: { type: 'number' } }),
+    }),
+    true,
+  );
+  assert.equal(isUploadStart({ name: 'other', inputSchema: ok }), false);
+  assert.equal(isUploadStart(undefined), false);
+  assert.equal(
+    isUploadStart({ name: 'start_upload', inputSchema: schema({ job: { type: 'string' } }) }),
+    false,
+  );
+  assert.equal(
+    isUploadStart({
+      name: 'start_upload',
+      inputSchema: schema({ filename: { type: 'string' }, bytes: { type: 'string' } }),
+    }),
+    false,
+  );
+  // The marker decides, either way.
+  assert.equal(
+    isUploadStart({
+      name: 'start_upload',
+      inputSchema: { type: 'object' },
+      _meta: { [UPLOAD_META_KEY]: { version: 1 } },
+    }),
+    true,
+  );
+  assert.equal(
+    isUploadStart({
+      name: 'start_upload',
+      inputSchema: ok,
+      _meta: { [UPLOAD_META_KEY]: { version: 2 } },
+    }),
+    false,
+  );
 });

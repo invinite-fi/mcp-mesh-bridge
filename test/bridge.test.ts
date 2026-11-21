@@ -8,6 +8,7 @@ import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
 import { bridge } from '../src/bridge.js';
 import { signIn } from '../src/oauth.js';
 import type { SecretStore } from '../src/store.js';
+import { UPLOAD_META_KEY } from '../src/upload.js';
 import { browser, freePort, memoryStore, startFake, type Fake } from './fake.js';
 
 const VERSION = '2025-06-18';
@@ -18,6 +19,8 @@ afterEach(async () => {
 
 type Claude = {
   request: (method: string, params?: Record<string, unknown>) => Promise<JSONRPCMessage>;
+  /** The methods of the notifications Claude was sent. */
+  notifications: string[];
   notify: (method: string) => Promise<void>;
 };
 
@@ -46,8 +49,10 @@ const connect = async (
     ...(pickFile ? { pickFile } : {}),
   });
   const answers = new Map<string | number, (m: JSONRPCMessage) => void>();
+  const notifications: string[] = [];
   claude.onmessage = (m) => {
     if ('id' in m && m.id !== undefined && !('method' in m)) answers.get(m.id)?.(m);
+    else if ('method' in m && !('id' in m)) notifications.push(m.method);
   };
   await claude.start();
   cleanups.push(async () => {
@@ -63,6 +68,7 @@ const connect = async (
         void claude.send({ jsonrpc: '2.0', id: rid, method, ...(params ? { params } : {}) });
       }),
     notify: (method) => claude.send({ jsonrpc: '2.0', method }),
+    notifications,
   };
 };
 
@@ -333,4 +339,86 @@ test('augments paginated tools/list only on the page that offers start_upload', 
     ['start_upload', 'upload_local_file'],
   );
   assert.equal(page2.nextCursor, undefined);
+});
+
+const toolNames = async (claude: Claude): Promise<string[]> =>
+  (result(await claude.request('tools/list')).tools as { name: string }[]).map((t) => t.name);
+
+const callUpload = async (claude: Claude, args: Record<string, unknown>) =>
+  result(await claude.request('tools/call', { name: 'upload_local_file', arguments: args })) as {
+    isError?: boolean;
+    content: { text: string }[];
+  };
+
+test('a start_upload for something else gets no upload_local_file', async () => {
+  const fake = await started({
+    uploads: true,
+    startUploadTool: {
+      name: 'start_upload',
+      inputSchema: { type: 'object', properties: { job: { type: 'string' } } },
+    },
+  });
+  let pickerCalled = false;
+  const claude = await connect(fake.mcp, memoryStore(), browser().open, {
+    pickFile: async () => {
+      pickerCalled = true;
+      return undefined;
+    },
+  });
+  await initialize(claude);
+  await claude.notify('notifications/initialized');
+
+  assert.deepEqual(await toolNames(claude), ['echo', 'start_upload']);
+  const res = await callUpload(claude, {});
+  assert.equal(res.isError, true);
+  assert.match(res.content[0]?.text ?? '', /offers no start_upload the bridge can use/);
+  assert.equal(pickerCalled, false);
+});
+
+test('a start_upload marked in its _meta gets upload_local_file whatever its schema', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mcp-mesh-bridge-meta-'));
+  cleanups.push(() => rm(dir, { recursive: true, force: true }));
+  const sample = join(dir, 'Notes.pdf');
+  await writeFile(sample, '%PDF-1.7 meta');
+
+  const fake = await started({
+    uploads: true,
+    startUploadTool: {
+      name: 'start_upload',
+      inputSchema: { type: 'object' },
+      _meta: { [UPLOAD_META_KEY]: { version: 1 } },
+    },
+  });
+  const claude = await connect(fake.mcp, memoryStore(), browser().open);
+  await initialize(claude);
+  await claude.notify('notifications/initialized');
+
+  assert.deepEqual(await toolNames(claude), ['echo', 'start_upload', 'upload_local_file']);
+  const res = await callUpload(claude, { path: sample });
+  assert.notEqual(res.isError, true, res.content[0]?.text);
+});
+
+test('tools changing on the server have upload support asked again', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mcp-mesh-bridge-changed-'));
+  cleanups.push(() => rm(dir, { recursive: true, force: true }));
+  const sample = join(dir, 'Later.pdf');
+  await writeFile(sample, '%PDF-1.7 later');
+
+  const fake = await started({ uploads: true, toggle: true });
+  const claude = await connect(fake.mcp, memoryStore(), browser().open);
+  await initialize(claude);
+  await claude.notify('notifications/initialized');
+
+  // No start_upload yet: the bridge learns the server has no upload.
+  assert.deepEqual(await toolNames(claude), ['echo', 'toggle_uploads']);
+  assert.equal((await callUpload(claude, { path: sample })).isError, true);
+
+  // The server lists start_upload and says its tools changed; Claude hears it too.
+  await claude.request('tools/call', { name: 'toggle_uploads', arguments: {} });
+  assert.ok(claude.notifications.includes('notifications/tools/list_changed'));
+
+  // Without a new tools/list, the bridge asks the server again and uploads.
+  const res = await callUpload(claude, { path: sample });
+  assert.notEqual(res.isError, true, res.content[0]?.text);
+  assert.equal(fake.uploaded.size, 1);
 });

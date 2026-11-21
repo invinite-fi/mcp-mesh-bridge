@@ -12,6 +12,7 @@ import {
   isInitializeRequest,
   isInitializedNotification,
   isJSONRPCErrorResponse,
+  isJSONRPCNotification,
   isJSONRPCRequest,
   isJSONRPCResultResponse,
   type CallToolResult,
@@ -26,6 +27,7 @@ import {
   handleUploadLocalFile,
   pickLocalFile,
   redactUploadUrl,
+  isUploadStart,
   REMOTE_START_UPLOAD,
   UPLOAD_TOOL_NAME,
   uploadLocalFileTool,
@@ -140,7 +142,8 @@ export const bridge = async (local: Transport, opts: BridgeOptions): Promise<voi
       augmentedInCycle = false;
     }
     const tools = res.tools as Tool[];
-    const startUpload = toolNamed(tools, REMOTE_START_UPLOAD);
+    const named = toolNamed(tools, REMOTE_START_UPLOAD);
+    const startUpload = isUploadStart(named) ? named : undefined;
     const hasStartUpload = startUpload !== undefined;
     const hasLocalUpload = hasToolNamed(tools, UPLOAD_TOOL_NAME);
     const hasMorePages = typeof res.nextCursor === 'string' && res.nextCursor.length > 0;
@@ -177,6 +180,12 @@ export const bridge = async (local: Transport, opts: BridgeOptions): Promise<voi
       fetch: guarded,
     });
     t.onmessage = (m) => {
+      // The server's tools changed: what it supports is asked again with the
+      // list Claude asks for next. The notification goes on to Claude.
+      if (isJSONRPCNotification(m) && m.method === 'notifications/tools/list_changed') {
+        uploadSupport = 'unknown';
+        augmentedInCycle = false;
+      }
       if (
         (isJSONRPCResultResponse(m) || isJSONRPCErrorResponse(m)) &&
         m.id !== undefined &&
@@ -353,7 +362,7 @@ export const bridge = async (local: Transport, opts: BridgeOptions): Promise<voi
           uploadSupport = 'remote';
           return uploadSupport;
         }
-        if (hasToolNamed(tools, REMOTE_START_UPLOAD)) {
+        if (isUploadStart(toolNamed(tools, REMOTE_START_UPLOAD))) {
           foundStart = true;
         }
         if (typeof res.nextCursor === 'string' && res.nextCursor.length > 0) {
@@ -389,7 +398,7 @@ export const bridge = async (local: Transport, opts: BridgeOptions): Promise<voi
               content: [
                 {
                   type: 'text',
-                  text: `This server does not support ${UPLOAD_TOOL_NAME} (${REMOTE_START_UPLOAD} is not available).`,
+                  text: `This server does not support ${UPLOAD_TOOL_NAME} (it offers no ${REMOTE_START_UPLOAD} the bridge can use).`,
                 },
               ],
             },

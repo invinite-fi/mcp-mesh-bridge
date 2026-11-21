@@ -52,9 +52,14 @@ export const startFake = async (
     uploadUrlOrigin?: string;
     ownUploadTool?: boolean;
     paginatedTools?: boolean;
+    /** `start_upload` as listed, in place of the fake's own definition. */
+    startUploadTool?: { name: string; description?: string; inputSchema: object; _meta?: object };
+    /** Offer `toggle_uploads`, which lists or unlists `start_upload` and says the tools changed. */
+    toggle?: boolean;
   } = {},
 ) => {
   const requireAuth = opts.auth ?? true;
+  let listUploads = !opts.toggle;
   const clients = new Set<string>(opts.staticClient ? [opts.staticClient] : []);
   const codes = new Map<string, Pending>();
   const refresh = new Map<string, string>();
@@ -238,7 +243,12 @@ export const startFake = async (
         }
         const tools: { name: string; description?: string; inputSchema: object }[] =
           opts.paginatedTools ? [] : [{ name: 'echo', inputSchema: { type: 'object' } }];
-        if (opts.uploads) {
+        if (opts.toggle) {
+          tools.push({ name: 'toggle_uploads', inputSchema: { type: 'object' } });
+        }
+        if (opts.uploads && listUploads && opts.startUploadTool) {
+          tools.push(opts.startUploadTool);
+        } else if (opts.uploads && listUploads) {
           tools.push({
             name: 'start_upload',
             description: 'Start an upload; then call store_file with its upload_id.',
@@ -280,7 +290,22 @@ export const startFake = async (
           });
           return;
         }
-        if (opts.uploads && params.name === 'start_upload') {
+        if (opts.toggle && params.name === 'toggle_uploads') {
+          listUploads = !listUploads;
+          // Answered as a stream, the tools' change said before the result.
+          res.writeHead(200, { 'content-type': 'text/event-stream' });
+          const event = (m: unknown) => `event: message\ndata: ${JSON.stringify(m)}\n\n`;
+          res.write(event({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }));
+          res.end(
+            event({
+              jsonrpc: '2.0',
+              id: msg.id,
+              result: { content: [{ type: 'text', text: `uploads listed: ${listUploads}` }] },
+            }),
+          );
+          return;
+        }
+        if (opts.uploads && listUploads && params.name === 'start_upload') {
           const filename = String(params.arguments?.filename ?? '');
           const bytes = Number(params.arguments?.bytes ?? 0);
           const keep =

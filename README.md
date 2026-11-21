@@ -19,8 +19,12 @@ picker or an explicit path) straight to that server without passing file bytes t
 
 ## Uploading local files
 
-A server that wants local files offers a tool named `start_upload`. The bridge then adds
-`upload_local_file`, unless the server has a tool of that name itself. It takes `path` (or opens
+A server that wants local files offers a tool named `start_upload` that takes a string `filename`
+and a numeric `bytes`. The bridge then adds `upload_local_file`, unless the server has a tool of
+that name itself. A `start_upload` of other arguments gets none, as it is for something else. A
+server may also say so outright, whatever its schema, in the tool's `_meta`:
+`"fi.invinite/mcp-mesh-bridge-upload": {"version": 1}`; another version gets none. When the server
+says its tools changed (`notifications/tools/list_changed`), the bridge looks again. It takes `path` (or opens
 the system's file picker without one) and every argument of `start_upload` but `filename` and
 `bytes`, which the bridge fills in from the file. It passes those arguments on as Claude gives them.
 
