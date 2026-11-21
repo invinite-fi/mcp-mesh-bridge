@@ -34,8 +34,9 @@ the system's file picker without one) and every argument of `start_upload` but `
    no sign-in with it.
 4. A 2xx answer means the file arrived. A JSON answer may say `{"state": "failed", "error": "…"}`,
    which the bridge reports.
-5. The bridge gives Claude the `upload_id`, and the rest of what `start_upload` said, without its
-   URL. That is where the server says what to do with the upload next.
+5. The bridge gives Claude the `upload_id` and what to do with the upload next: `next` from
+   `structuredContent` if the server gives it, else the rest of what `start_upload` said, without
+   its URL.
 
 ## Install
 

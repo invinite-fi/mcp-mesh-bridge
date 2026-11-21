@@ -350,3 +350,31 @@ test('redactUploadUrl strips an issued upload URL wherever it is said, whatever 
   assert.ok(!said.includes('SECRET_ISSUED'), said);
   assert.ok(!said.includes('SIG_ISSUED'), said);
 });
+
+test('handleUploadLocalFile passes on structuredContent.next alone when the server gives it', async () => {
+  const dir = await tempDir();
+  const file = join(dir, 'a.bin');
+  await writeFile(file, 'abc');
+  const res = await handleUploadLocalFile(
+    { path: file },
+    {
+      serverUrl: new URL('https://srv.example/mcp'),
+      fetch: async () => new Response('', { status: 200 }),
+      log: () => undefined,
+      pickFile: async () => undefined,
+      callRemoteTool: async () => ({
+        content: [{ type: 'text', text: 'PUT it with curl -T to https://srv.example/u/1/TOK' }],
+        structuredContent: {
+          upload_id: 'u-1',
+          upload_url: 'https://srv.example/u/1/TOK',
+          next: 'Then call store_it with upload_id u-1.',
+        },
+      }),
+    },
+  );
+  const said = (res.content[0] as { text: string }).text;
+  assert.notEqual(res.isError, true, said);
+  assert.match(said, /upload_id: u-1/);
+  assert.match(said, /Then call store_it/);
+  assert.doesNotMatch(said, /curl|TOK/);
+});

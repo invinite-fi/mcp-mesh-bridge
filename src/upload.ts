@@ -395,11 +395,17 @@ const textFromResult = (res: CallToolResult): string =>
     .join('\n');
 
 /**
- * What the server's `start_upload` said to do with the upload, less its URL,
- * which the bridge has used and Claude never needs.
+ * What the server's `start_upload` said to do with the upload: its
+ * `structuredContent.next`, else its text less the URL, which the bridge has
+ * used and Claude never needs.
  */
-const nextStep = (said: string, parsed: StartUploadResult, target: URL): string => {
-  const rest = said
+const nextStep = (started: CallToolResult, parsed: StartUploadResult, target: URL): string => {
+  // A server may say the step after the PUT on its own, as `structuredContent.next`.
+  const next = (started.structuredContent as { next?: unknown } | undefined)?.next;
+  if (typeof next === 'string' && next.trim()) {
+    return clip(redactUploadUrl(next.trim(), target, parsed.uploadUrl), 2000);
+  }
+  const rest = textFromResult(started)
     .split(/\r?\n/)
     .filter((line) => !/^[-*•\s]*\*{0,2}upload_(id|url)\*{0,2}\s*:/i.test(line.trim()))
     .join('\n')
@@ -591,7 +597,7 @@ export const handleUploadLocalFile = async (
       `Uploaded ${filename} (${size} bytes).\n` +
         `upload_id: ${parsed.uploadId}\n` +
         `state: ${state}\n\n` +
-        nextStep(textFromResult(started), parsed, target),
+        nextStep(started, parsed, target),
     );
   } finally {
     if (!streamCreated) {
