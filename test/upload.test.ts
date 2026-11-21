@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterEach, test } from 'node:test';
 import {
   handleUploadLocalFile,
@@ -96,8 +96,11 @@ test('redactUploadUrl strips upload tokens from direct and custom URLs', () => {
 });
 
 test('resolveLocalPath expands leading tilde', () => {
-  assert.equal(resolveLocalPath('~/Docs/report.pdf', '/home/alice'), '/home/alice/Docs/report.pdf');
-  assert.equal(resolveLocalPath('~', '/home/alice'), '/home/alice');
+  // Native to the platform: on Windows a rooted path resolves onto the current drive.
+  const home = resolve('/home/alice');
+  assert.equal(resolveLocalPath('~/Docs/report.pdf', home), join(home, 'Docs', 'report.pdf'));
+  assert.equal(resolveLocalPath('~\\Docs\\report.pdf', home), resolve(home, 'Docs\\report.pdf'));
+  assert.equal(resolveLocalPath('~', home), home);
 });
 
 test('pickerCommand uses fixed system binary paths, never PATH, and activates dialog focus', () => {
