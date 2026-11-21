@@ -12,7 +12,35 @@ This bridge runs on your own machine instead. Claude Desktop starts it as a loca
 passes every message on to the server's streamable-HTTP endpoint, unchanged, and passes the answers
 back. Your machine is on the private network, so the server is in reach.
 
-The bridge knows no tools of its own. Whatever the server offers, Claude sees.
+The bridge knows no domain tools of its own: whatever the server offers, Claude sees. When a
+server offers `start_upload` for single-use direct HTTP PUT uploads, the bridge automatically adds
+`upload_local_file` so Claude Desktop can stream a local file from disk (via the native OS file
+picker or an explicit path) straight to that server without passing file bytes through the chat.
+
+## Uploading local files
+
+A server that wants local files offers a tool named `start_upload` that takes a string `filename`
+and a numeric `bytes`. The bridge then adds `upload_local_file`, unless the server has a tool of
+that name itself. A `start_upload` of other arguments gets none, as it is for something else. A
+server may also say so outright, whatever its schema, in the tool's `_meta`:
+`"fi.invinite/mcp-mesh-bridge-upload": {"version": 1}`; another version gets none. When the server
+says its tools changed (`notifications/tools/list_changed`), the bridge looks again. It takes `path` (or opens
+the system's file picker without one) and every argument of `start_upload` but `filename` and
+`bytes`, which the bridge fills in from the file. It passes those arguments on as Claude gives them.
+
+1. The bridge calls `start_upload` with `filename` (the file's name, without its folder), `bytes`
+   (its size) and the other arguments.
+2. The result names `upload_id` and `upload_url`, in `structuredContent`, as a JSON text, or as
+   `upload_id: …` and `upload_url: …` lines of text.
+3. The bridge sends the whole file in one `PUT` to `upload_url`, with `Content-Length` and
+   `application/octet-stream`. The URL must be on the server URL's own origin, and the bridge
+   follows no redirect. The URL should work once and carry its own credential, as the bridge sends
+   no sign-in with it.
+4. A 2xx answer means the file arrived. A JSON answer may say `{"state": "failed", "error": "…"}`,
+   which the bridge reports.
+5. The bridge gives Claude the `upload_id` and what to do with the upload next: `next` from
+   `structuredContent` if the server gives it, else the rest of what `start_upload` said, without
+   its URL.
 
 ## Install
 
@@ -112,11 +140,13 @@ it names your private server.
 - It never writes a token to a log, and keeps no secret on a command line.
 - It has one runtime dependency, the official MCP TypeScript SDK, bundled into the extension.
 
-**The browser.** The bridge opens a sign-in address only if it is `https:`. It also opens `http:`
-when the address is on your own machine, or when the server URL is `http:` itself. It logs where
-the sign-in is. It starts the browser with a fixed program: `/usr/bin/open` on macOS,
-`rundll32.exe` from Windows' `System32`, or `xdg-open` from a system folder. It never runs a
-program found on `PATH`.
+**The browser and file picker.** The bridge opens a sign-in address only if it is `https:`. It also
+opens `http:` when the address is on your own machine, or when the server URL is `http:` itself. It
+logs where the sign-in is. It starts the browser and the native file picker with fixed system
+programs: `/usr/bin/open` and `/usr/bin/osascript` on macOS, `rundll32.exe` and Windows PowerShell
+from `System32` on Windows, or `xdg-open` / `zenity` / `kdialog` from a system folder on Linux. It
+never runs a program found on `PATH`. `upload_local_file` only streams to the configured server's
+own origin, never follows redirects, and never writes upload URLs or tokens to a log.
 
 **What the Keychain protects.** On macOS the key is a Keychain item that `/usr/bin/security`
 created. Any program running as you can read it with that same tool, without asking you. So the
