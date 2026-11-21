@@ -6,6 +6,9 @@ import { afterEach, test } from 'node:test';
 import {
   handleUploadLocalFile,
   parseStartUpload,
+  parseStartUploadResult,
+  rememberUploadUrl,
+  uploadLocalFileTool,
   pickerCommand,
   pickLocalFile,
   redactUploadUrl,
@@ -297,4 +300,53 @@ test('handleUploadLocalFile redacts upload URLs from fetch errors and detects mi
   );
   assert.equal(sizeChanged.isError, true);
   assert.match((sizeChanged.content[0] as { text: string }).text, /changed size/i);
+});
+
+test('parseStartUploadResult prefers structuredContent', () => {
+  assert.deepEqual(
+    parseStartUploadResult({
+      content: [{ type: 'text', text: 'Upload started.' }],
+      structuredContent: { upload_id: 'u-1', upload_url: 'https://files.example/put/u-1/t' },
+    }),
+    { uploadId: 'u-1', uploadUrl: 'https://files.example/put/u-1/t' },
+  );
+  assert.deepEqual(
+    parseStartUploadResult({
+      content: [{ type: 'text', text: 'upload_id: u-2\nupload_url: https://files.example/u-2' }],
+    }),
+    { uploadId: 'u-2', uploadUrl: 'https://files.example/u-2' },
+  );
+});
+
+test('uploadLocalFileTool follows the server, naming nothing of any one server', () => {
+  const plain = uploadLocalFileTool();
+  assert.deepEqual(Object.keys(plain.inputSchema.properties ?? {}), ['path']);
+  assert.doesNotMatch(JSON.stringify(plain), /add_source|keep|PowerPoint/);
+
+  const tool = uploadLocalFileTool({
+    name: 'start_upload',
+    description: 'Starts one.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filename: { type: 'string' },
+        bytes: { type: 'integer' },
+        path: { type: 'string', description: 'the server would take this' },
+        folder: { type: 'string' },
+      },
+      required: ['filename', 'bytes', 'folder'],
+    },
+  });
+  assert.deepEqual(Object.keys(tool.inputSchema.properties ?? {}).sort(), ['folder', 'path']);
+  assert.deepEqual(tool.inputSchema.required, ['folder']);
+  assert.match(tool.description ?? '', /Starts one\./);
+});
+
+test('redactUploadUrl strips an issued upload URL wherever it is said, whatever its path', () => {
+  rememberUploadUrl(new URL('https://files.example/any/shape/SECRET_ISSUED?sig=SIG_ISSUED'));
+  const said = redactUploadUrl(
+    'PUT https://files.example/any/shape/SECRET_ISSUED?sig=SIG_ISSUED failed',
+  );
+  assert.ok(!said.includes('SECRET_ISSUED'), said);
+  assert.ok(!said.includes('SIG_ISSUED'), said);
 });

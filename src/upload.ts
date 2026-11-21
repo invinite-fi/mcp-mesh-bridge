@@ -24,35 +24,60 @@ const PICKER_TIMEOUT_MS = 5 * 60_000;
 /** Maximum stdout/stderr bytes buffered from the native file picker process. */
 const MAX_PICKER_OUTPUT = 64 * 1024;
 
-export const UPLOAD_LOCAL_FILE_TOOL: Tool = {
-  name: UPLOAD_TOOL_NAME,
+/** What the bridge itself fills in of `start_upload`'s arguments, from the file. */
+const BRIDGE_START_ARGS = new Set(['filename', 'bytes']);
+/** The bridge's own argument, never passed on to `start_upload`. */
+const PATH_ARG = 'path';
+
+const PATH_PROPERTY = {
+  type: 'string',
   description:
-    'Upload a binary file (PDF, Word, PowerPoint, Excel, JPEG, PNG, WebP, GIF, etc.) from this ' +
-    'machine directly to the server without passing file bytes through the chat. Omit `path` to ' +
-    'open the native file picker dialog so the user can choose a file, or pass a local file path. ' +
-    'Returns the `upload_id` to pass to the server (for example `add_source`).',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      path: {
-        type: 'string',
-        description:
-          'Path to a local file on this machine (a leading `~` expands to the home folder). ' +
-          'Omit to open the system file picker.',
-      },
-      keep: {
-        type: 'boolean',
-        description:
-          'For pictures only: true keeps the picture as it is (e.g. a photo) rather than reading it.',
-      },
-    },
-  },
-  annotations: {
-    readOnlyHint: false,
-    destructiveHint: false,
-    openWorldHint: false,
-  },
+    'Path to a local file on this machine (a leading `~` expands to the home folder). ' +
+    'Omit to open the system file picker.',
 };
+
+const UPLOAD_DESCRIPTION =
+  'Upload a file from this machine straight to the server, without passing its bytes through ' +
+  "the chat. Omit `path` to open the system's file picker so the user can choose a file, or pass " +
+  "a local file path. Returns the server's `upload_id` and what the server says to do with it.";
+
+/**
+ * `upload_local_file` for a server whose `start_upload` is `start`: `path`, and
+ * every argument of `start_upload` but the `filename` and `bytes` the bridge
+ * fills in, passed on as given.
+ */
+export const uploadLocalFileTool = (start?: Tool): Tool => {
+  const schema = start?.inputSchema as
+    { properties?: Record<string, unknown>; required?: unknown } | undefined;
+  const extra = Object.fromEntries(
+    Object.entries(schema?.properties ?? {}).filter(
+      ([k]) => !BRIDGE_START_ARGS.has(k) && k !== PATH_ARG,
+    ),
+  );
+  const required = (Array.isArray(schema?.required) ? schema.required : []).filter(
+    (k): k is string => typeof k === 'string' && !BRIDGE_START_ARGS.has(k) && k !== PATH_ARG,
+  );
+  const about = start?.description?.trim();
+  return {
+    name: UPLOAD_TOOL_NAME,
+    description: about
+      ? `${UPLOAD_DESCRIPTION}\n\nThe server's ${REMOTE_START_UPLOAD}, which this calls: ${about}`
+      : UPLOAD_DESCRIPTION,
+    inputSchema: {
+      type: 'object',
+      properties: { ...extra, [PATH_ARG]: PATH_PROPERTY },
+      ...(required.length > 0 ? { required } : {}),
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: false,
+    },
+  };
+};
+
+/** `upload_local_file` before the server's `start_upload` is known. */
+export const UPLOAD_LOCAL_FILE_TOOL: Tool = uploadLocalFileTool();
 
 export type StartUploadResult = {
   uploadId: string;
@@ -65,27 +90,40 @@ const cleanFieldValue = (raw: string): string =>
     .replace(/^[`"'<]+|[`"'>]+$/g, '')
     .trim();
 
+const fromFields = (json: Record<string, unknown>): StartUploadResult | undefined => {
+  const field = (snake: string, camel: string): string =>
+    typeof json[snake] === 'string'
+      ? cleanFieldValue(json[snake])
+      : typeof json[camel] === 'string'
+        ? cleanFieldValue(json[camel])
+        : '';
+  const id = field('upload_id', 'uploadId');
+  const url = field('upload_url', 'uploadUrl');
+  return id && url && !/\s/.test(id) && !/\s/.test(url)
+    ? { uploadId: id, uploadUrl: url }
+    : undefined;
+};
+
+/**
+ * The upload a `start_upload` result names: its `structuredContent`, else its
+ * text as JSON or as `upload_id:` and `upload_url:` lines.
+ */
+export const parseStartUploadResult = (res: CallToolResult): StartUploadResult | undefined => {
+  const structured = res.structuredContent;
+  if (structured && typeof structured === 'object') {
+    const found = fromFields(structured);
+    if (found) return found;
+  }
+  return parseStartUpload(textFromResult(res));
+};
+
 /** Parse `upload_id:` and `upload_url:` lines (or JSON) returned by the remote `start_upload` tool. */
 export const parseStartUpload = (text: string): StartUploadResult | undefined => {
   const trimmed = text.trim();
   if (trimmed.startsWith('{')) {
     try {
-      const json = JSON.parse(trimmed) as Record<string, unknown>;
-      const id =
-        typeof json.upload_id === 'string'
-          ? cleanFieldValue(json.upload_id)
-          : typeof json.uploadId === 'string'
-            ? cleanFieldValue(json.uploadId)
-            : '';
-      const url =
-        typeof json.upload_url === 'string'
-          ? cleanFieldValue(json.upload_url)
-          : typeof json.uploadUrl === 'string'
-            ? cleanFieldValue(json.uploadUrl)
-            : '';
-      if (id && url && !/\s/.test(id) && !/\s/.test(url)) {
-        return { uploadId: id, uploadUrl: url };
-      }
+      const found = fromFields(JSON.parse(trimmed) as Record<string, unknown>);
+      if (found) return found;
     } catch {
       // Fall through to line-by-line parsing.
     }
@@ -133,28 +171,40 @@ export const validateUploadUrl = (uploadUrl: string, serverUrl: URL): URL => {
   return parsed;
 };
 
+/** Upload URLs servers issued lately, redacted from whatever the bridge says. */
+const issued: URL[] = [];
+const MAX_ISSUED = 32;
+
+/** Remember an upload URL a server issued, so that no message passes it on. */
+export const rememberUploadUrl = (url: URL): void => {
+  issued.push(url);
+  if (issued.length > MAX_ISSUED) issued.shift();
+};
+
+const redactTarget = (text: string, target: URL): string => {
+  let out = text.split(target.href).join(`${target.origin}/<redacted-upload-url>`);
+  if (target.search.length > 1) {
+    out = out.split(target.search).join('?<redacted>');
+  }
+  if (target.hash.length > 1) {
+    out = out.split(target.hash).join('#<redacted>');
+  }
+  if (target.pathname.length > 1) {
+    out = out.split(target.pathname).join('/<redacted-upload-path>');
+  }
+  return out;
+};
+
 /** Strip any single-use upload URL or path token from an error message or log line. */
 export const redactUploadUrl = (text: string, target?: URL, rawUrl?: string): string => {
-  let out = text.replace(
-    /\/uploads\/direct\/([^/\s"'<>]+)\/([^/\s"'<>?#]+)/gi,
-    '/uploads/direct/$1/<redacted>',
-  );
+  let out = text;
   if (rawUrl) {
     out = out
       .split(rawUrl)
       .join(target ? `${target.origin}/<redacted-upload-url>` : '<redacted-upload-url>');
   }
-  if (target) {
-    out = out.split(target.href).join(`${target.origin}/<redacted-upload-url>`);
-    if (target.search.length > 1) {
-      out = out.split(target.search).join('?<redacted>');
-    }
-    if (target.hash.length > 1) {
-      out = out.split(target.hash).join('#<redacted>');
-    }
-    if (target.pathname.length > 1) {
-      out = out.split(target.pathname).join('/<redacted-upload-path>');
-    }
+  for (const url of target ? [target, ...issued] : issued) {
+    out = redactTarget(out, url);
   }
   return out;
 };
@@ -344,6 +394,23 @@ const textFromResult = (res: CallToolResult): string =>
     .map((c) => c.text)
     .join('\n');
 
+/**
+ * What the server's `start_upload` said to do with the upload, less its URL,
+ * which the bridge has used and Claude never needs.
+ */
+const nextStep = (said: string, parsed: StartUploadResult, target: URL): string => {
+  const rest = said
+    .split(/\r?\n/)
+    .filter((line) => !/^[-*•\s]*\*{0,2}upload_(id|url)\*{0,2}\s*:/i.test(line.trim()))
+    .join('\n')
+    .trim();
+  const safe = rest.startsWith('{') ? '' : redactUploadUrl(rest, target, parsed.uploadUrl);
+  return safe
+    ? 'The file has been sent: any instructions below for sending it are done. What the server ' +
+        `said when the upload started, for what to do next:\n${clip(safe, 2000)}`
+    : `Pass upload_id "${parsed.uploadId}" to the server's tool that takes it.`;
+};
+
 export type UploadContext = {
   serverUrl: URL;
   fetch: FetchLike;
@@ -359,10 +426,6 @@ export const handleUploadLocalFile = async (
   const pathArg = rawArgs?.path;
   if (pathArg !== undefined && typeof pathArg !== 'string') {
     return toolError('`path` must be a string');
-  }
-  const keepArg = rawArgs?.keep;
-  if (keepArg !== undefined && typeof keepArg !== 'boolean') {
-    return toolError('`keep` must be a boolean');
   }
 
   let localPath: string;
@@ -408,8 +471,12 @@ export const handleUploadLocalFile = async (
     }
 
     const filename = basename(localPath);
-    const startArgs: Record<string, unknown> = { filename, bytes: size };
-    if (keepArg !== undefined) startArgs.keep = keepArg;
+    // The server's own arguments go on as given; the file's name and size are the bridge's.
+    const startArgs: Record<string, unknown> = Object.fromEntries(
+      Object.entries(rawArgs ?? {}).filter(([k]) => k !== PATH_ARG && !BRIDGE_START_ARGS.has(k)),
+    );
+    startArgs.filename = filename;
+    startArgs.bytes = size;
 
     let started: CallToolResult;
     try {
@@ -423,7 +490,7 @@ export const handleUploadLocalFile = async (
       return started;
     }
 
-    const parsed = parseStartUpload(textFromResult(started));
+    const parsed = parseStartUploadResult(started);
     if (!parsed) {
       return toolError('The server did not return an upload_id and upload_url from start_upload.');
     }
@@ -434,6 +501,7 @@ export const handleUploadLocalFile = async (
     } catch (e) {
       return toolError(redactUploadUrl((e as Error).message, undefined, parsed.uploadUrl));
     }
+    rememberUploadUrl(target);
 
     const currentInfo = await fh.stat();
     if (!currentInfo.isFile() || currentInfo.size !== size) {
@@ -523,7 +591,7 @@ export const handleUploadLocalFile = async (
       `Uploaded ${filename} (${size} bytes).\n` +
         `upload_id: ${parsed.uploadId}\n` +
         `state: ${state}\n\n` +
-        `Next: call \`add_source\` with \`upload_id: "${parsed.uploadId}"\` (along with title, kind, and any optional metadata).`,
+        nextStep(textFromResult(started), parsed, target),
     );
   } finally {
     if (!streamCreated) {

@@ -236,11 +236,22 @@ export const startFake = async (
           });
           return;
         }
-        const tools = opts.paginatedTools
-          ? []
-          : [{ name: 'echo', inputSchema: { type: 'object' } }];
+        const tools: { name: string; description?: string; inputSchema: object }[] =
+          opts.paginatedTools ? [] : [{ name: 'echo', inputSchema: { type: 'object' } }];
         if (opts.uploads) {
-          tools.push({ name: 'start_upload', inputSchema: { type: 'object' } });
+          tools.push({
+            name: 'start_upload',
+            description: 'Start an upload; then call store_file with its upload_id.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                filename: { type: 'string' },
+                bytes: { type: 'number' },
+                keep: { type: 'boolean', description: 'A server-specific flag.' },
+              },
+              required: ['filename', 'bytes'],
+            },
+          });
         }
         if (opts.ownUploadTool) {
           tools.push({ name: 'upload_local_file', inputSchema: { type: 'object' } });
@@ -290,7 +301,7 @@ export const startFake = async (
               content: [
                 {
                   type: 'text',
-                  text: `upload_id: ${id}\nupload_url: ${origin}/uploads/direct/${id}/${tok}\n`,
+                  text: `upload_id: ${id}\nupload_url: ${origin}/uploads/direct/${id}/${tok}\n\nThen call store_file with upload_id ${id}.`,
                 },
               ],
             },

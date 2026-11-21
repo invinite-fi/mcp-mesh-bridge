@@ -27,8 +27,8 @@ import {
   pickLocalFile,
   redactUploadUrl,
   REMOTE_START_UPLOAD,
-  UPLOAD_LOCAL_FILE_TOOL,
   UPLOAD_TOOL_NAME,
+  uploadLocalFileTool,
 } from './upload.js';
 
 export type BridgeOptions = {
@@ -91,8 +91,10 @@ const protocolVersionOf = (result: unknown): string | undefined => {
   return typeof v === 'string' ? v : undefined;
 };
 
-const hasToolNamed = (tools: Tool[], name: string): boolean =>
-  tools.some((t) => Boolean(t && typeof t === 'object' && t.name === name));
+const toolNamed = (tools: Tool[], name: string): Tool | undefined =>
+  tools.find((t) => Boolean(t && typeof t === 'object' && t.name === name));
+
+const hasToolNamed = (tools: Tool[], name: string): boolean => toolNamed(tools, name) !== undefined;
 
 /** Relay between `local` (Claude) and the server, until `local` closes. */
 export const bridge = async (local: Transport, opts: BridgeOptions): Promise<void> => {
@@ -127,8 +129,8 @@ export const bridge = async (local: Transport, opts: BridgeOptions): Promise<voi
 
   /**
    * Inspect a `tools/list` result, update `uploadSupport`, and append
-   * `UPLOAD_LOCAL_FILE_TOOL` when the server advertises `start_upload`
-   * without defining its own `upload_local_file`.
+   * `upload_local_file`, built from the server's `start_upload`, when the
+   * server advertises `start_upload` without defining its own `upload_local_file`.
    */
   const inspectAndAugmentToolsList = (m: JSONRPCMessage, hasCursor: boolean): JSONRPCMessage => {
     if (!isJSONRPCResultResponse(m)) return m;
@@ -138,7 +140,8 @@ export const bridge = async (local: Transport, opts: BridgeOptions): Promise<voi
       augmentedInCycle = false;
     }
     const tools = res.tools as Tool[];
-    const hasStartUpload = hasToolNamed(tools, REMOTE_START_UPLOAD);
+    const startUpload = toolNamed(tools, REMOTE_START_UPLOAD);
+    const hasStartUpload = startUpload !== undefined;
     const hasLocalUpload = hasToolNamed(tools, UPLOAD_TOOL_NAME);
     const hasMorePages = typeof res.nextCursor === 'string' && res.nextCursor.length > 0;
 
@@ -156,7 +159,7 @@ export const bridge = async (local: Transport, opts: BridgeOptions): Promise<voi
         ...m,
         result: {
           ...res,
-          tools: [...tools, UPLOAD_LOCAL_FILE_TOOL],
+          tools: [...tools, uploadLocalFileTool(startUpload)],
         },
       };
     }

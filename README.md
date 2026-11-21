@@ -17,6 +17,26 @@ server offers `start_upload` for single-use direct HTTP PUT uploads, the bridge 
 `upload_local_file` so Claude Desktop can stream a local file from disk (via the native OS file
 picker or an explicit path) straight to that server without passing file bytes through the chat.
 
+## Uploading local files
+
+A server that wants local files offers a tool named `start_upload`. The bridge then adds
+`upload_local_file`, unless the server has a tool of that name itself. It takes `path` (or opens
+the system's file picker without one) and every argument of `start_upload` but `filename` and
+`bytes`, which the bridge fills in from the file. It passes those arguments on as Claude gives them.
+
+1. The bridge calls `start_upload` with `filename` (the file's name, without its folder), `bytes`
+   (its size) and the other arguments.
+2. The result names `upload_id` and `upload_url`, in `structuredContent`, as a JSON text, or as
+   `upload_id: …` and `upload_url: …` lines of text.
+3. The bridge sends the whole file in one `PUT` to `upload_url`, with `Content-Length` and
+   `application/octet-stream`. The URL must be on the server URL's own origin, and the bridge
+   follows no redirect. The URL should work once and carry its own credential, as the bridge sends
+   no sign-in with it.
+4. A 2xx answer means the file arrived. A JSON answer may say `{"state": "failed", "error": "…"}`,
+   which the bridge reports.
+5. The bridge gives Claude the `upload_id`, and the rest of what `start_upload` said, without its
+   URL. That is where the server says what to do with the upload next.
+
 ## Install
 
 Download the `.mcpb` file from the [latest release](https://github.com/invinite-fi/mcp-mesh-bridge/releases/latest)

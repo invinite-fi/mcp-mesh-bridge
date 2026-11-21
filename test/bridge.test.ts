@@ -193,11 +193,20 @@ test('advertises upload_local_file when the server offers start_upload and strea
   await initialize(claude);
   await claude.notify('notifications/initialized');
 
-  const tools = result(await claude.request('tools/list')).tools as { name: string }[];
+  const tools = result(await claude.request('tools/list')).tools as {
+    name: string;
+    description?: string;
+    inputSchema: { properties?: Record<string, unknown>; required?: string[] };
+  }[];
   assert.deepEqual(
     tools.map((t) => t.name),
     ['echo', 'start_upload', 'upload_local_file'],
   );
+  // The bridge's tool takes the server's own arguments, less the file's name and size.
+  const local = tools.find((t) => t.name === 'upload_local_file');
+  assert.deepEqual(Object.keys(local?.inputSchema.properties ?? {}).sort(), ['keep', 'path']);
+  assert.equal(local?.inputSchema.required, undefined);
+  assert.match(local?.description ?? '', /store_file/);
 
   // 1. Upload by explicit local path (with keep flag).
   const byPath = result(
@@ -213,6 +222,9 @@ test('advertises upload_local_file when the server offers start_upload and strea
   assert.equal(stored1?.filename, 'Proposal.pdf');
   assert.deepEqual(stored1?.bytes, bytes);
   assert.equal(stored1?.keep, true);
+  // What to do next is the server's word, without the upload URL.
+  assert.match(byPath.content[0]?.text ?? '', /Then call store_file/);
+  assert.doesNotMatch(byPath.content[0]?.text ?? '', /tok-|upload_url|add_source/);
 
   // 2. Upload via native picker fallback (path omitted), even across a forgotten session.
   fake.forget();
